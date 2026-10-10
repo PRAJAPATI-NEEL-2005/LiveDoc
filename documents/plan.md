@@ -38,7 +38,26 @@ LiveDoc/
 
 ---
 
-## 3. Strict Collaboration Plan: Who Does What?
+## 3. Environment Setup (CRITICAL FOR BOTH)
+
+**⚠️ CRITICAL WARNING:** Do NOT use Python 3.13 (or newer) for this project. Machine learning libraries like `paddlepaddle` and `ultralytics` do not yet support Python 3.13. You must use **Python 3.10**.
+
+Before writing any code, both Viraj and Neel must run these exact commands in their terminal to setup the correct environment using Conda:
+
+```bash
+# 1. Create a clean Conda environment with Python 3.10
+conda create -n livedoc python=3.10 -y
+
+# 2. Activate the new environment
+conda activate livedoc
+
+# 3. Install all required dependencies
+pip install -r requirements.txt
+```
+
+---
+
+## 4. Strict Collaboration Plan: Who Does What?
 
 To ensure the pipeline connects properly without bugs, every function must have an agreed-upon **Input** and **Output**. 
 
