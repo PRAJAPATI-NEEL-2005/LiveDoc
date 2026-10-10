@@ -96,13 +96,13 @@ Viraj is in charge of getting the physical image into the computer, correcting i
 #### File 3: `src/gui.py` & `main.py`
 *   **Class:** `LiveDocApp`
 *   **Goal:** Build the PyQt6 window to display the camera and the final extracted text.
-*   **Integration Logic:** Viraj will import Neel's classes here to complete the pipeline.
-    - When the user clicks "Scan", Viraj will pass his flattened image to Neel's `LayoutAnalyzer`.
+*   **Integration Logic:** Neel will import Viraj's classes here to complete the pipeline.
+    - When the user clicks "Scan", Neel will pass the flattened image to Viraj's `LayoutAnalyzer`.
 
 ---
 
-### Part B: NEEL'S RESPONSIBILITIES (AI, Deep Learning, & OCR)
-Neel is in charge of taking a perfect top-down image (provided by Viraj), finding the paragraphs/tables, and reading the text.
+### Part B: VIRAJ'S RESPONSIBILITIES (AI, Deep Learning, & OCR Backend)
+Viraj is in charge of taking a perfect top-down image, finding the paragraphs/tables using YOLO, and reading the text via PaddleOCR.
 
 #### File 1: `src/layout_analyzer.py`
 *   **Class:** `LayoutAnalyzer`
@@ -132,7 +132,7 @@ Neel is in charge of taking a perfect top-down image (provided by Viraj), findin
 
 ## 4. How to Connect The Pipeline (The Grand Finale)
 
-Once Viraj and Neel finish their separate files, they will combine them in `main.py` using this exact pipeline sequence:
+Once Viraj and Neel finish their separate files, Neel will combine them in `main.py` using this exact pipeline sequence:
 
 ```python
 # 1. Initialization
