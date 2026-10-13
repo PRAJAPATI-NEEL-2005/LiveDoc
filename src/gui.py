@@ -344,6 +344,19 @@ class LiveDocApp(QMainWindow):
         ctrl_layout.setContentsMargins(0, 4, 0, 0)
         ctrl_layout.setSpacing(12)
 
+        # Camera selector dropdown
+        cam_select_label = QLabel("Camera:")
+        cam_select_label.setStyleSheet("color: #94a3b8; font-weight: bold; font-size: 12px;")
+
+        self.cam_combo = QComboBox()
+        self.cam_combo.setToolTip("Select which camera to use")
+        self.cam_combo.currentIndexChanged.connect(self._on_camera_changed)
+
+        self.btn_refresh = QPushButton("Refresh")
+        self.btn_refresh.setObjectName("btn_refresh")
+        self.btn_refresh.setToolTip("Rescan for available cameras")
+        self.btn_refresh.clicked.connect(self._refresh_cameras)
+
         self.btn_camera = QPushButton("  Start Camera")
         self.btn_camera.setObjectName("btn_camera")
         self.btn_camera.setCheckable(True)
@@ -360,16 +373,70 @@ class LiveDocApp(QMainWindow):
         self.btn_clear.setObjectName("btn_clear")
         self.btn_clear.clicked.connect(self.result_text.clear)
 
+        ctrl_layout.addWidget(cam_select_label)
+        ctrl_layout.addWidget(self.cam_combo)
+        ctrl_layout.addWidget(self.btn_refresh)
+        ctrl_layout.addSpacing(8)
         ctrl_layout.addWidget(self.btn_camera)
         ctrl_layout.addStretch()
         ctrl_layout.addWidget(self.btn_clear)
         ctrl_layout.addWidget(self.btn_scan)
         root_layout.addWidget(controls)
 
-        # Status bar
+        # Status bar (must be created before _refresh_cameras)
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Ready  •  Python 3.10  •  PaddleOCR + YOLO backend loaded")
+
+        # Detect cameras on startup
+        self._refresh_cameras()
+
+    # ── Camera Selection ────────────────────────────────────
+    def _refresh_cameras(self):
+        """Scan for available cameras and populate the dropdown."""
+        self.status_bar.showMessage("Scanning for cameras...")
+        QApplication.processEvents()  # Show the message before blocking scan
+
+        self.available_cameras = LiveCameraManager.detect_cameras(max_index=10)
+
+        # Block signal to avoid triggering _on_camera_changed during rebuild
+        self.cam_combo.blockSignals(True)
+        self.cam_combo.clear()
+
+        if self.available_cameras:
+            for idx, label in self.available_cameras:
+                self.cam_combo.addItem(label, userData=idx)
+            self.status_bar.showMessage(
+                f"Found {len(self.available_cameras)} camera(s) — select one and click Start Camera"
+            )
+        else:
+            self.cam_combo.addItem("No cameras found")
+            self.status_bar.showMessage("No cameras detected — connect a camera and click Refresh")
+
+        self.cam_combo.blockSignals(False)
+
+    def _on_camera_changed(self, combo_index):
+        """Switch to the camera selected in the dropdown."""
+        if combo_index < 0 or combo_index >= len(self.available_cameras):
+            return
+
+        cam_index = self.available_cameras[combo_index][0]
+        cam_label = self.available_cameras[combo_index][1]
+
+        # If camera is running, stop it, switch, restart
+        was_running = self.camera_running
+        if was_running:
+            self.timer.stop()
+
+        success = self.camera.switch_camera(cam_index)
+
+        if success:
+            self.status_bar.showMessage(f"Switched to {cam_label}")
+        else:
+            self.status_bar.showMessage(f"Failed to open {cam_label}")
+
+        if was_running and success:
+            self.timer.start(30)
 
     # ── Camera Timer ──────────────────────────────────────
     def _setup_camera_timer(self):
