@@ -1,82 +1,176 @@
+"""
+LiveDoc Document Detector & Geometric Preprocessor
+Handles:
+- Real-time document edge & contour detection with dual Canny/Adaptive thresholding.
+- Perspective transformation (4-point warping into flat top-down view).
+- Multi-metric quality assessment: Blur/Sharpness, Glare, Lighting, Positioning guidance.
+- Dynamic contrast stretching for clean OCR readability without stroke erosion.
+"""
+
 import cv2
 import numpy as np
 
+
 class DocumentDetector:
     def __init__(self):
-        """Initialize the document detector."""
-        pass
+        self.debug_edges = None
 
-    def is_blurry(self, frame, threshold=50):
+    def is_blurry(self, frame, threshold=22):
         """
         Check if the image is too blurry to read.
-        Returns True if blurry, False if sharp.
+        Optimized with downscaling for sub-millisecond execution.
         """
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = frame.shape[:2]
+        if w > 480:
+            scale = 480.0 / float(w)
+            small = cv2.resize(frame, (480, int(h * scale)), interpolation=cv2.INTER_AREA)
+        else:
+            small = frame
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         variance = cv2.Laplacian(gray, cv2.CV_64F).var()
         return variance < threshold
 
-    def find_document(self, frame):
+    def get_sharpness_score(self, frame):
+        """Compute the numeric sharpness score of a frame."""
+        h, w = frame.shape[:2]
+        if w > 480:
+            scale = 480.0 / float(w)
+            small = cv2.resize(frame, (480, int(h * scale)), interpolation=cv2.INTER_AREA)
+        else:
+            small = frame
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    def assess_frame_quality(self, frame, corners=None):
         """
-        Find the 4 corners of the document in the frame.
-        Returns a numpy array of the 4 coordinates, or None if no document is found.
+        Comprehensive quality & positioning evaluation:
+        - Blur / Sharpness check
+        - Glare & overexposure check
+        - Distance & centering assessment
         """
-        # Store frame area to ensure the document takes up a decent chunk of the screen
-        frame_area = frame.shape[0] * frame.shape[1]
-        
+        orig_h, orig_w = frame.shape[:2]
+        sharpness = self.get_sharpness_score(frame)
+
+        if sharpness < 20.0:
+            return {
+                "status": "BLURRY",
+                "message": "Hold Steady — Focus Incomplete",
+                "color": (0, 140, 255),
+                "score": sharpness
+            }
+
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # Heavy blur to remove text inside the paper, leaving only the outer paper edge
-        blurred = cv2.GaussianBlur(gray, (11, 11), 0)
-        
-        # Adaptive thresholding often works better than Canny in weird lighting
-        thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 11, 2)
-        
-        # Morphological operation to close gaps
+        glare_ratio = float(np.sum(gray > 250)) / float(orig_h * orig_w)
+        if glare_ratio > 0.08:
+            return {
+                "status": "GLARE",
+                "message": "Glare Detected — Adjust Light Angle",
+                "color": (0, 200, 255),
+                "score": sharpness
+            }
+
+        if corners is not None:
+            rect = self._order_points(corners)
+            box_w = np.linalg.norm(rect[1] - rect[0])
+            box_h = np.linalg.norm(rect[3] - rect[0])
+            doc_area = box_w * box_h
+            screen_area = orig_h * orig_w
+            coverage = doc_area / screen_area
+
+            doc_cx = float(np.mean(corners[:, 0]))
+            doc_cy = float(np.mean(corners[:, 1]))
+            center_x_dist = abs(doc_cx - (orig_w / 2.0)) / orig_w
+            center_y_dist = abs(doc_cy - (orig_h / 2.0)) / orig_h
+
+            if coverage < 0.18:
+                return {
+                    "status": "TOO_FAR",
+                    "message": "Move Phone Closer to Document",
+                    "color": (0, 215, 255),
+                    "score": sharpness
+                }
+            elif center_x_dist > 0.25 or center_y_dist > 0.25:
+                return {
+                    "status": "OFF_CENTER",
+                    "message": "Center the Document in Frame",
+                    "color": (0, 215, 255),
+                    "score": sharpness
+                }
+
+            return {
+                "status": "LOCKED",
+                "message": "Document Boundary Locked — Ready to Scan",
+                "color": (0, 220, 100),
+                "score": sharpness
+            }
+
+        return {
+            "status": "FULL_FRAME",
+            "message": "Full Document Mode — Ready",
+            "color": (0, 220, 100),
+            "score": sharpness
+        }
+
+    def find_document(self, frame):
+        orig_h, orig_w = frame.shape[:2]
+        target_w = 600
+        if orig_w > target_w:
+            scale = target_w / float(orig_w)
+            small = cv2.resize(frame, (target_w, int(orig_h * scale)), interpolation=cv2.INTER_AREA)
+        else:
+            scale = 1.0
+            small = frame
+
+        small_h, small_w = small.shape[:2]
+        small_area = small_h * small_w
+        min_doc_area = small_area * 0.15
+        max_doc_area = small_area * 0.98
+
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        v = np.median(blurred)
+        lower = int(max(0, (1.0 - 0.33) * v))
+        upper = int(min(255, (1.0 + 0.33) * v))
+        canny = cv2.Canny(blurred, lower, upper)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-        edged = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-        
-        # Save edged for debugging in the test block
-        self.debug_edges = edged.copy()
-        
-        contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
-        
-        for c in contours:
-            area = cv2.contourArea(c)
-            # The document must take up at least 5% of the frame and not the entire frame
-            if area < (frame_area * 0.05) or area > (frame_area * 0.95):
-                continue
-                
-            # Looser approximation (0.05 instead of 0.02) to handle slightly bent paper
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.05 * peri, True)
-            
-            if len(approx) == 4 and cv2.isContourConvex(approx):
-                return approx.reshape(4, 2)
-                
+        dilated = cv2.dilate(canny, kernel, iterations=1)
+
+        thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
+        morph = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+
+        self.debug_edges = dilated.copy()
+
+        for edge_img in [dilated, morph]:
+            contours, _ = cv2.findContours(edge_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+
+            for c in contours:
+                area = cv2.contourArea(c)
+                if area < min_doc_area or area > max_doc_area:
+                    continue
+
+                peri = cv2.arcLength(c, True)
+                for eps in [0.02, 0.03, 0.04, 0.05, 0.07]:
+                    approx = cv2.approxPolyDP(c, eps * peri, True)
+                    if len(approx) == 4 and cv2.isContourConvex(approx):
+                        pts = (approx.reshape(4, 2) / scale).astype(int)
+                        return pts
+
         return None
 
     def _order_points(self, pts):
-        """
-        Order points consistently: [top-left, top-right, bottom-right, bottom-left].
-        """
         rect = np.zeros((4, 2), dtype="float32")
-        
         s = pts.sum(axis=1)
         rect[0] = pts[np.argmin(s)]
         rect[2] = pts[np.argmax(s)]
-        
+
         diff = np.diff(pts, axis=1)
         rect[1] = pts[np.argmin(diff)]
         rect[3] = pts[np.argmax(diff)]
-        
         return rect
 
     def flatten_document(self, frame, corners):
-        """
-        Warp the perspective to flatten the document into a top-down view.
-        Returns the cropped and flattened document image as a numpy array.
-        """
         rect = self._order_points(corners)
         (tl, tr, br, bl) = rect
 
@@ -99,43 +193,14 @@ class DocumentDetector:
         warped = cv2.warpPerspective(frame, M, (maxWidth, maxHeight))
         return warped
 
-# --- Quick Test ---
-if __name__ == "__main__":
-    from camera_manager import LiveCameraManager
-    
-    print("Testing DocumentDetector... Show a piece of paper to the camera!")
-    print("Press 'q' to quit.")
-    
-    camera = LiveCameraManager(0)
-    detector = DocumentDetector()
-    
-    while True:
-        frame = camera.get_frame()
-        if frame is None:
-            break
-            
-        display_frame = frame.copy()
-        
-        if detector.is_blurry(frame):
-            cv2.putText(display_frame, "BLURRY!", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            
-        corners = detector.find_document(frame)
-        
-        # Show what the computer is actually "seeing" to help debug!
-        if hasattr(detector, 'debug_edges'):
-            cv2.imshow("Debug: What the computer sees (Edges)", detector.debug_edges)
-        
-        if corners is not None:
-            cv2.drawContours(display_frame, [corners], -1, (0, 255, 0), 3)
-            cv2.putText(display_frame, "Document Found", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            
-            flattened = detector.flatten_document(frame, corners)
-            cv2.imshow("Flattened Document", flattened)
-            
-        cv2.imshow("Live Scanner", display_frame)
-        
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-            
-    camera.release()
-    cv2.destroyAllWindows()
+    def preprocess_for_ocr(self, image):
+        """
+        Gentle contrast normalization to ensure high dynamic range without eroding thin font strokes.
+        """
+        if image is None or image.size == 0:
+            return image
+
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        norm = cv2.normalize(gray, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8UC1)
+        enhanced = cv2.cvtColor(norm, cv2.COLOR_GRAY2BGR)
+        return enhanced
