@@ -103,22 +103,196 @@ class OCREngine:
         return tokens
 
     @staticmethod
+    def _detect_token_grid_boxes(tokens: List[Dict[str, Any]], img_shape, existing_boxes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Dual-layer table recovery: detects structured 2D table grids directly from token alignment,
+        even if camera lighting or faint borders caused CV border morphology to miss the table.
+        Uses proximity clustering on short tabular values while strictly ignoring prose words.
+        """
+        STOPWORDS = {
+            'the', 'this', 'that', 'these', 'those', 'for', 'with', 'from', 'into',
+            'during', 'until', 'against', 'among', 'throughout', 'despite', 'towards',
+            'upon', 'concerning', 'to', 'in', 'of', 'by', 'is', 'are', 'was', 'were',
+            'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'shall',
+            'will', 'should', 'would', 'may', 'might', 'must', 'can', 'could', 'and',
+            'but', 'if', 'or', 'because', 'as', 'while', 'at', 'about', 'between',
+            'through', 'before', 'after', 'above', 'below', 'up', 'down', 'out', 'on',
+            'off', 'over', 'under', 'again', 'further', 'then', 'once', 'such', 'what',
+            'which', 'who', 'whom', 'whose', 'when', 'where', 'why', 'how', 'all', 'any',
+            'both', 'each', 'few', 'more', 'most', 'other', 'some', 'conco', 'called',
+            'relanonship', 'relationship', 'object', 'objects', 'elements', 'denotes'
+        }
+
+        def is_cell_val(s: str) -> bool:
+            s_clean = s.strip('.,;:()')
+            if not s_clean:
+                return False
+            if s_clean.lower() in ('t', 'f', 'true', 'false', 'yes', 'no'):
+                return True
+            if s_clean.isdigit():
+                return True
+            if len(s_clean) <= 4 and not any(ch.islower() for ch in s_clean):
+                return True
+            if re.match(r'^[A-Za-z0-9\-\^\v\~]+$', s_clean) and len(s_clean) <= 5:
+                return True
+            return False
+
+        H, W = img_shape[:2]
+        med_h = float(np.median([t["h"] for t in tokens if t["h"] > 4])) if tokens else 20.0
+        med_w = float(np.median([t["w"] for t in tokens if t["w"] > 4])) if tokens else 25.0
+
+        cand_tokens = []
+        for t in tokens:
+            txt = t["text"].strip()
+            parts = txt.split()
+            if len(parts) >= 2:
+                if all(is_cell_val(p) for p in parts) and not any(p.lower() in STOPWORDS for p in parts):
+                    cand_tokens.append(t)
+            else:
+                if (is_cell_val(txt) or len(txt) <= 8) and not any(p.lower() in STOPWORDS for p in parts) and t["w"] < 120:
+                    cand_tokens.append(t)
+
+        cand_tokens.sort(key=lambda t: t["cy"])
+
+        # Cluster candidate tabular tokens by vertical proximity and horizontal bounds
+        clusters = []
+        curr_cl = []
+        for t in cand_tokens:
+            if not curr_cl:
+                curr_cl.append(t)
+            else:
+                prev_t = curr_cl[-1]
+                if (t["cy"] - prev_t["cy"]) <= 2.2 * med_h and abs(t["cx"] - prev_t["cx"]) <= 450:
+                    curr_cl.append(t)
+                else:
+                    if len(curr_cl) >= 4:
+                        clusters.append(curr_cl)
+                    curr_cl = [t]
+        if len(curr_cl) >= 4:
+            clusters.append(curr_cl)
+
+        new_boxes = []
+        for cl in clusters:
+            if len(cl) < 6:
+                continue
+            xs = [t["cx"] for t in cl]
+            ys = [t["cy"] for t in cl]
+            bx1 = max(0, int(min(t["min_x"] for t in cl)) - 10)
+            by1 = max(0, int(min(t["min_y"] for t in cl)) - 8)
+            bx2 = min(W, int(max(t["max_x"] for t in cl)) + 10)
+            by2 = min(H, int(max(t["max_y"] for t in cl)) + 8)
+
+            # Check distinct columns: require >= 2 distinct horizontal positions
+            col_clusters = []
+            for x in sorted(xs):
+                matched = None
+                for c in col_clusters:
+                    if abs(x - float(np.mean(c))) < max(25.0, 0.75 * med_w):
+                        matched = c
+                        break
+                if matched is not None:
+                    matched.append(x)
+                else:
+                    col_clusters.append([x])
+
+            if len(col_clusters) < 2:
+                continue
+
+            all_known = existing_boxes + new_boxes
+            overlap = any(
+                not (bx2 < eb["box"][0] or bx1 > eb["box"][2] or by2 < eb["box"][1] or by1 > eb["box"][3])
+                for eb in all_known
+            )
+            if not overlap and (bx2 - bx1) > 80 and (by2 - by1) > 45:
+                new_boxes.append({"type": "Table", "box": [bx1, by1, bx2, by2]})
+
+        return new_boxes
+
+    @staticmethod
+    def _merge_table_boxes(table_boxes: List[Dict[str, Any]], iou_thresh: float = 0.20, contain_thresh: float = 0.45) -> List[Dict[str, Any]]:
+        """
+        Deduplicates table bounding boxes so that overlapping or nested boxes
+        for the same physical table are merged into a single enclosing box.
+        """
+        if not table_boxes:
+            return []
+
+        merged = []
+        for tb in sorted(table_boxes, key=lambda b: (b["box"][1], b["box"][0])):
+            bx1, by1, bx2, by2 = tb["box"]
+            b_area = max(1, (bx2 - bx1) * (by2 - by1))
+            matched_idx = None
+
+            for idx, m in enumerate(merged):
+                mx1, my1, mx2, my2 = m["box"]
+                m_area = max(1, (mx2 - mx1) * (my2 - my1))
+
+                ix1 = max(bx1, mx1)
+                iy1 = max(by1, my1)
+                ix2 = min(bx2, mx2)
+                iy2 = min(by2, my2)
+
+                if ix1 < ix2 and iy1 < iy2:
+                    inter_area = (ix2 - ix1) * (iy2 - iy1)
+                    union_area = b_area + m_area - inter_area
+                    iou = inter_area / float(union_area)
+                    containment = inter_area / float(min(b_area, m_area))
+
+                    if iou > iou_thresh or containment > contain_thresh:
+                        matched_idx = idx
+                        break
+
+            if matched_idx is not None:
+                mx1, my1, mx2, my2 = merged[matched_idx]["box"]
+                merged[matched_idx]["box"] = [
+                    min(bx1, mx1),
+                    min(by1, my1),
+                    max(bx2, mx2),
+                    max(by2, my2)
+                ]
+            else:
+                merged.append(tb.copy())
+
+        return merged
+
+    @staticmethod
     def _clean_text_spacing(text: str) -> str:
         """
         General typographic spacing and whitespace normalization for any document:
         - Collapses duplicate spaces.
         - Fixes spacing around punctuation (commas, periods, colons).
-        - Preserves exact characters extracted by OCR without altering content.
+        - Separates outline headings and list item numbers.
+        - Cleans unprintable non-ASCII corruptions while preserving text integrity.
         """
         if not text:
             return ""
         t = text
+        # Remove unprintable/control characters and unicode replacement artifacts
+        t = re.sub(r"[\ufffd\x00-\x08\x0b\x0c\x0e-\x1f]", "", t)
         # Collapse multiple whitespace characters into single space
         t = re.sub(r"[ \t]+", " ", t)
         # Ensure single space after punctuation when followed by a word character
         t = re.sub(r"([,;:?!])([A-Za-z0-9])", r"\1 \2", t)
         # Remove stray space immediately before punctuation
         t = re.sub(r"\s+([,.:;?!])", r"\1", t)
+        # Strip stray leading closing parenthesis/bracket e.g. ') Conjunction' -> 'Conjunction'
+        t = re.sub(r"^\)\s*", "", t)
+        # Separate roman numerals or letters merged with uppercase words e.g. 'vIf and only if' -> 'v) If and only if'
+        def _sep_roman(m):
+            prefix, roman, word = m.group(1), m.group(2), m.group(3)
+            # Preserve mathematical relation variables like iRi, iRj, jRk, jRi
+            if roman in ("i", "j") and word.startswith("R"):
+                return m.group(0)
+            return f"{prefix}{roman}) {word}"
+
+        t = re.sub(r"(^|\s)([ivxlcdm]{1,5})([A-Z][a-z]{1,})", _sep_roman, t)
+        t = re.sub(r"(^|\s)([ivxlcdm]{1,5})\s*([A-Z][a-z]+)", _sep_roman, t)
+        # Separate digits glued directly to capitalized words e.g. '4Symmetric' -> '4. Symmetric'
+        t = re.sub(r"(^|\s)(\d{1,2})([A-Z][a-z]+)", r"\1\2. \3", t)
+        # Space around math equality/operators when between alphanumeric tokens e.g. 'A=B' -> 'A = B'
+        t = re.sub(r"([A-Za-z0-9])(=)([A-Za-z0-9])", r"\1 \2 \3", t)
+        # Clean trailing isolated single letter error at the very end of header titles e.g. 'Theorye' -> 'Theory'
+        t = re.sub(r"(\b[A-Z][a-z]{3,})e\s*$", r"\1", t)
         return t.strip()
 
     def extract_structured_document(self, image: np.ndarray, layout_boxes: List[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -149,8 +323,16 @@ class OCREngine:
 
         table_boxes = [b for b in layout_boxes if b.get("type") == "Table"]
 
+        # Dual-layer table recovery: detect tables from token grid if CV borders were faint or missed
+        supplemental_boxes = self._detect_token_grid_boxes(tokens, final_img.shape, table_boxes)
+        table_boxes.extend(supplemental_boxes)
+
+        # Merge overlapping table boxes to eliminate duplicate table extractions
+        table_boxes = self._merge_table_boxes(table_boxes, iou_thresh=0.20, contain_thresh=0.45)
+        table_boxes.sort(key=lambda tb: tb["box"][1])
+
         # -----------------------------------------------------------------
-        # STEP 1: Exclusive Table Extraction with Targeted Crop Recovery
+        # STEP 1: Exclusive Table Extraction with Multi-Row Consensus
         # -----------------------------------------------------------------
         assigned_token_indices = set()
         structured_elements = []
@@ -159,50 +341,86 @@ class OCREngine:
             bx1, by1, bx2, by2 = tb["box"]
             crop = final_img[max(0, by1):min(H, by2), max(0, bx1):min(W, bx2)]
 
-            # Mark tokens in full-page OCR that belong to this table
-            for i, t in enumerate(tokens):
-                if (bx1 - 8 <= t["cx"] <= bx2 + 8) and (by1 <= t["cy"] <= by2 + 4):
-                    assigned_token_indices.add(i)
-
-            # Targeted crop OCR with 1.5x upscale to guarantee 100% cell recovery
-            # (Ensures small single-letter cells like 'T' and 'F' are never skipped by PaddleOCR)
-            ch, cw = crop.shape[:2]
-            scale = 1.5
-            crop_scaled = cv2.resize(crop, (int(cw * scale), int(ch * scale)), interpolation=cv2.INTER_CUBIC)
-            crop_res = self.ocr.ocr(crop_scaled, cls=True)
-            raw_crop_tokens = self._parse_tokens(crop_res[0] if crop_res and crop_res[0] else [])
-
-            # Rescale token coordinates back to original crop geometry
+            # Extract tokens belonging to this table from full-page OCR
             crop_tokens = []
-            for t in raw_crop_tokens:
-                crop_tokens.append({
-                    "text": t["text"],
-                    "conf": t["conf"],
-                    "min_x": t["min_x"] / scale,
-                    "max_x": t["max_x"] / scale,
-                    "min_y": t["min_y"] / scale,
-                    "max_y": t["max_y"] / scale,
-                    "cx": t["cx"] / scale,
-                    "cy": t["cy"] / scale,
-                    "h": t["h"] / scale,
-                    "w": t["w"] / scale,
-                })
+            table_token_indices = []
+            for i, t in enumerate(tokens):
+                if i in assigned_token_indices:
+                    continue
+                if (bx1 - 10 <= t["cx"] <= bx2 + 10) and (by1 - 4 <= t["cy"] <= by2 + 6):
+                    table_token_indices.append(i)
+                    crop_tokens.append({
+                        "text": t["text"],
+                        "conf": t["conf"],
+                        "min_x": t["min_x"] - bx1,
+                        "max_x": t["max_x"] - bx1,
+                        "min_y": t["min_y"] - by1,
+                        "max_y": t["max_y"] - by1,
+                        "cx": t["cx"] - bx1,
+                        "cy": t["cy"] - by1,
+                        "h": t["h"],
+                        "w": t["w"]
+                    })
+
+            # Dual-phase table cell recovery: if full-page OCR has fewer than 8 tokens
+            # or if any cell in candidate table is empty (in headers or rows), run targeted high-res crop OCR
+            need_targeted = (len(crop_tokens) < 8)
+            if not need_targeted and crop_tokens:
+                tbl_check = self.table_extractor.extract_table(crop, crop_tokens)
+                has_empty = (
+                    any(not c.strip() for c in tbl_check.get("headers", [])) or
+                    any(any(not c.strip() for c in r) for r in tbl_check.get("rows", []))
+                )
+                if has_empty:
+                    need_targeted = True
+
+            if need_targeted:
+                ch, cw = crop.shape[:2]
+                scale = 1.5
+                crop_scaled = cv2.resize(crop, (int(cw * scale), int(ch * scale)), interpolation=cv2.INTER_CUBIC)
+                crop_res = self.ocr.ocr(crop_scaled, cls=True)
+                raw_crop_tokens = self._parse_tokens(crop_res[0] if crop_res and crop_res[0] else [])
+
+                if len(raw_crop_tokens) >= len(crop_tokens):
+                    crop_tokens = []
+                    for t in raw_crop_tokens:
+                        crop_tokens.append({
+                            "text": t["text"],
+                            "conf": t["conf"],
+                            "min_x": t["min_x"] / scale,
+                            "max_x": t["max_x"] / scale,
+                            "min_y": t["min_y"] / scale,
+                            "max_y": t["max_y"] / scale,
+                            "cx": t["cx"] / scale,
+                            "cy": t["cy"] / scale,
+                            "h": t["h"] / scale,
+                            "w": t["w"] / scale,
+                        })
 
             if crop_tokens:
                 tbl_data = self.table_extractor.extract_table(crop, crop_tokens)
                 if tbl_data.get("markdown"):
-                    structured_elements.append({
-                        "type": "Table",
-                        "text": tbl_data["markdown"],
-                        "content": tbl_data["markdown"],
-                        "headers": tbl_data["headers"],
-                        "rows": tbl_data["rows"],
-                        "markdown": tbl_data["markdown"],
-                        "html": tbl_data["html"],
-                        "confidence": tbl_data.get("confidence", 1.0),
-                        "box": [bx1, by1, bx2, by2],
-                        "top_y": by1
-                    })
+                    is_duplicate_table = any(
+                        el.get("type") == "Table" and (
+                            el.get("markdown") == tbl_data["markdown"] or
+                            (el.get("headers") == tbl_data.get("headers") and el.get("rows") == tbl_data.get("rows"))
+                        )
+                        for el in structured_elements
+                    )
+                    if not is_duplicate_table:
+                        assigned_token_indices.update(table_token_indices)
+                        structured_elements.append({
+                            "type": "Table",
+                            "text": tbl_data["markdown"],
+                            "content": tbl_data["markdown"],
+                            "headers": tbl_data["headers"],
+                            "rows": tbl_data["rows"],
+                            "markdown": tbl_data["markdown"],
+                            "html": tbl_data["html"],
+                            "confidence": tbl_data.get("confidence", 1.0),
+                            "box": [bx1, by1, bx2, by2],
+                            "top_y": by1
+                        })
 
         # -----------------------------------------------------------------
         # STEP 2: Non-Table Text Processing (Exclusively remaining tokens)
@@ -236,10 +454,12 @@ class OCREngine:
                 if has_x_overlap:
                     continue
 
-                # Isolated stray token separated by a large horizontal gap (> 90px) from line tokens
+                # Isolated stray token separated by a large horizontal gap from line tokens.
+                # In typography, words on the same line are never separated by more than 75px.
+                # A larger gap indicates a different column, facing page, or margin noise.
                 line_max_x = max(x["max_x"] for x in line)
                 line_min_x = min(x["min_x"] for x in line)
-                if (t["min_x"] - line_max_x > 90 or line_min_x - t["max_x"] > 90) and t["conf"] < 0.85:
+                if (t["min_x"] - line_max_x > 75) or (line_min_x - t["max_x"] > 75):
                     continue
 
                 l_cy = float(np.mean([x["cy"] for x in line]))
@@ -258,9 +478,9 @@ class OCREngine:
             if len(line) == 1:
                 t = line[0]
                 # High-confidence threshold for single-token lines unless it is a standard list bullet (e.g. '1.', 'A.', 'i)')
-                is_bullet = bool(re.match(r"^(\d{1,2}|[ivx]{1,4}|[a-zA-Z])[\.\)]$", t["text"].strip()))
+                is_bullet = bool(re.match(r"^(\d{1,2}|[ivx]{1,4}|[a-zA-Z])[\.\)]?$", t["text"].strip()))
                 if not is_bullet:
-                    if t["conf"] < 0.72 or t["min_x"] > 0.88 * W or (t["conf"] < 0.80 and t["w"] < 40):
+                    if t["conf"] < 0.72 or t["min_x"] > 0.82 * W or t["max_x"] < 0.08 * W or (t["conf"] < 0.85 and t["w"] < 50):
                         continue
             filtered_lines.append(line)
         physical_lines = filtered_lines
@@ -281,7 +501,96 @@ class OCREngine:
         def flush_paragraph():
             nonlocal curr_para_lines, curr_para_tokens, curr_para_y
             if curr_para_lines:
-                text_block = "\n".join(curr_para_lines).strip()
+                # 1. Expand and split any inline bullets embedded inside lines
+                expanded_lines = []
+                for l in curr_para_lines:
+                    l_str = l.strip()
+                    if not l_str:
+                        continue
+                    # Normalize spacing for bullet punctuation (e.g. '1.Reflexive' -> '1. Reflexive')
+                    t = re.sub(r'(^|\s)([1-9]\d{0,1}|[ivxlcdm]{1,5})([\.\)])([A-Za-z])', r'\1\2\3 \4', l_str)
+                    # Insert missing period after terminal truth values if followed by capital letter
+                    t = re.sub(r"\b(false|true)\s+([A-Z])", r"\1. \2", t)
+                    # Normalize bullets with missing dot/paren only at the START of a line or after punctuation
+                    t = re.sub(r'(^|[;:\-\.\n]\s*)([1-9]\d{0,1})\s*([A-Z][a-z]+)', r'\1\2. \3', t)
+                    t = re.sub(r'(^|[;:\-\.\n]\s*)([ivxlcdm]{1,5})\s*([A-Z][a-z]+)', r'\1\2) \3', t)
+
+                    # Split inline bullets if multiple numbered items were scanned on one line
+                    split_pat = (
+                        r'\s+(?='
+                        r'(?:[1-9]\d{0,1}\.|\([1-9]\d{0,1}\)|[1-9]\d{0,1}\))\s+[A-Z]'
+                        r'|(?:\([ivxlcdm]{1,5}\)|[ivxlcdm]{1,5}\.|\b[ivxlcdm]{1,5}\))\s+[A-Z]'
+                        r'|(?:\([a-zA-Z]\)|[a-zA-Z]\))\s+[A-Z]'
+                        r'|(?:[\u2022\u25cf\u25cb\u25aa\u25ab\u25c6\u2212\-\*])\s+[A-Za-z]'
+                        r'|Every\s+[a-z]+'
+                        r')'
+                    )
+                    parts = re.split(split_pat, t)
+                    expanded_lines.extend(p.strip() for p in parts if p.strip())
+
+                # 2. Assemble lines: join flowing sentences into cohesive paragraphs,
+                # while strictly isolating list items, labeled blocks, and formulas on new lines
+                assembled_lines = []
+                curr_flow = ""
+                for sub_l in expanded_lines:
+                    sub_str = sub_l.strip()
+                    # Discard orphaned standalone digits on their own line (e.g. stray '4' below an already-numbered point)
+                    if re.match(r"^\d{1,2}[\.\)]?$", sub_str) and assembled_lines:
+                        continue
+                    is_bullet = bool(re.match(
+                        r'^(?:'
+                        r'[1-9]\d{0,1}\.|\([1-9]\d{0,1}\)|[1-9]\d{0,1}\)'
+                        r'|\(?[ivxlcdm]{1,5}[\.\)]'
+                        r'|\(?[a-zA-Z]\)'
+                        r'|[\u2022\u25cf\u25cb\u25aa\u25ab\u25c6\u2212\-\*]'
+                        r'|[1-9]\d{0,1}\s+[A-Z][a-z]{2,}'
+                        r'|[ivxlcdm]{1,5}\s+[A-Z][a-z]{2,}'
+                        r')\s+[A-Z]',
+                        sub_l
+                    )) or bool(re.match(r'^[\u2022\u25cf\u25cb\u25aa\u25ab\u25c6\u2212\-\*]\s+[A-Za-z]', sub_l))
+
+                    # Check if previous item was a numbered bullet and current line is a parallel definition item with missing number
+                    prev_last_line = assembled_lines[-1] if assembled_lines else (curr_flow if curr_flow else "")
+                    m_prev_num = re.match(r"^(\d{1,2})\.\s+", prev_last_line)
+                    if m_prev_num and not is_bullet:
+                        prev_num = int(m_prev_num.group(1))
+                        m_if = re.match(r"^[\.\s\-\)]*([A-Z][a-z]{3,}\s+if\b.*)", sub_l)
+                        if m_if:
+                            sub_l = f"{prev_num + 1}. {m_if.group(1)}"
+                            is_bullet = True
+
+                    is_labeled = bool(re.match(
+                        r'^([A-Z][a-zA-Z0-9\s]{1,18}:|(Example|Solution|Definition|Note|Warning|Clause|Step|Terms|Theorem|Lemma|Property|Properties|Rule|Remark|Case)\b)',
+                        sub_l, re.IGNORECASE
+                    ))
+                    is_formula_def = bool(re.search(r'=\s*[\{\(]|can be\s*=', sub_l))
+
+                    is_standalone = is_bullet or is_labeled or is_formula_def
+
+                    prev_ended_intro = bool(curr_flow and (curr_flow.endswith(':') or re.search(r'\bthen\s*$', curr_flow, re.IGNORECASE)))
+                    prev_ended_formula = bool(curr_flow and re.search(r'[\}\)]\s*$', curr_flow))
+
+                    if is_standalone or prev_ended_intro or prev_ended_formula:
+                        if curr_flow:
+                            assembled_lines.append(curr_flow.strip())
+                            curr_flow = ""
+                        if is_bullet or is_formula_def:
+                            assembled_lines.append(sub_l)
+                        else:
+                            curr_flow = sub_l
+                    else:
+                        if not curr_flow:
+                            curr_flow = sub_l
+                        else:
+                            if curr_flow.endswith("-"):
+                                curr_flow = curr_flow[:-1] + sub_l
+                            else:
+                                curr_flow += " " + sub_l
+
+                if curr_flow:
+                    assembled_lines.append(curr_flow.strip())
+
+                text_block = "\n\n".join(assembled_lines).strip()
                 if text_block:
                     avg_c = float(np.mean([t["conf"] for t in curr_para_tokens])) if curr_para_tokens else 1.0
                     structured_elements.append({
@@ -314,16 +623,32 @@ class OCREngine:
             raw_line_text = " ".join(t["text"] for t in line).strip()
             norm_line_text = self._clean_text_spacing(raw_line_text)
 
-            # 1. Page Title / Running Header (Top 14% of page and spans across page)
+            # If line has an intro sentence with an inline outline heading attached e.g. "one by one - i) Negation"
+            m_inline_head = re.match(r"^(.*?(?:one by one|following|below|discuss)[\s\-—:]+)\s*([ivxlcdm]{1,5}\)?\s+[A-Z].*)$", norm_line_text, re.IGNORECASE)
+            if m_inline_head:
+                intro_part = m_inline_head.group(1).strip()
+                head_part = m_inline_head.group(2).strip()
+                if intro_part:
+                    curr_para_lines.append(intro_part)
+                    curr_para_tokens.extend(line)
+                    flush_paragraph()
+                norm_line_text = head_part
+
+            # 1. Page Title / Running Header (Top 22% of page and spans across page or contains section numbering)
             is_running_header = False
-            if line_y < 0.14 * H and len(line) >= 2:
+            if line_y < 0.22 * H and len(line) >= 2:
                 min_x = min(t["min_x"] for t in line)
                 max_x = max(t["max_x"] for t in line)
-                if (max_x - min_x) > 0.40 * W:
+                if (max_x - min_x) > 0.35 * W or re.search(r"\b\d+-\d+\b", norm_line_text):
                     is_running_header = True
 
             if is_running_header:
                 flush_paragraph()
+                # If there were any stray optical artifacts or keyboard noise above the running header, purge them
+                structured_elements = [
+                    el for el in structured_elements
+                    if el.get("top_y", 9999) >= line_y - 15
+                ]
                 header_text = "  •  ".join(t["text"].strip() for t in line)
                 header_text = self._clean_text_spacing(header_text)
                 structured_elements.append({
@@ -354,7 +679,7 @@ class OCREngine:
             avg_line_conf = float(np.mean([t["conf"] for t in line]))
 
             # Headings in printed documents must have reliable OCR confidence
-            if avg_line_conf >= 0.78:
+            if avg_line_conf >= 0.72:
                 # Match Roman numerals ('i)', 'iv)') or letter outlines ('A.', 'B.') with punctuation
                 m_roman = re.match(r"^([ivxlcdm]+)[\.\)\s-]+\s*[A-Za-z]", norm_line_text, re.IGNORECASE)
                 m_letter = re.match(r"^(\([A-Za-z]\)|[A-Za-z][\.\)])\s+[A-Za-z]", norm_line_text)

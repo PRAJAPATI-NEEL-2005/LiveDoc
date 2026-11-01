@@ -31,6 +31,7 @@ from src.camera_manager import LiveCameraManager
 from src.document_detector import DocumentDetector
 from src.layout_analyzer import LayoutAnalyzer
 from src.ocr_engine import OCREngine
+from src.pdf_exporter import PDFExporter
 
 
 # ─────────────────────────────────────────────────────────
@@ -216,6 +217,14 @@ class LiveDocApp(QMainWindow):
             }
             QPushButton#btn_export:hover {
                 background-color: #0369a1;
+            }
+            QPushButton#btn_pdf {
+                background-color: #dc2626;
+                color: #ffffff;
+                font-weight: bold;
+            }
+            QPushButton#btn_pdf:hover {
+                background-color: #b91c1c;
             }
             QPushButton#btn_secondary {
                 background-color: #21262d;
@@ -426,6 +435,10 @@ class LiveDocApp(QMainWindow):
         self.btn_scan.setMinimumWidth(180)
         self.btn_scan.clicked.connect(self.scan_document)
 
+        self.btn_pdf = QPushButton("📄 Save as PDF")
+        self.btn_pdf.setObjectName("btn_pdf")
+        self.btn_pdf.clicked.connect(self._save_as_pdf)
+
         self.btn_export = QPushButton("Export Document...")
         self.btn_export.setObjectName("btn_export")
         self.btn_export.clicked.connect(self._export_document)
@@ -442,6 +455,7 @@ class LiveDocApp(QMainWindow):
         ctrl_layout.addWidget(self.btn_rotate)
         ctrl_layout.addStretch()
         ctrl_layout.addWidget(self.btn_clear)
+        ctrl_layout.addWidget(self.btn_pdf)
         ctrl_layout.addWidget(self.btn_export)
         ctrl_layout.addWidget(self.btn_scan)
 
@@ -702,28 +716,65 @@ class LiveDocApp(QMainWindow):
             f"Page {self.page_count} digitized! Extracted {len(elements)} elements ({table_count} table(s))."
         )
 
+    def _save_as_pdf(self):
+        """Direct one-click shortcut to export digitized document as publication-ready PDF."""
+        if not self.all_pages_markdown:
+            QMessageBox.information(self, "Save as PDF", "No scanned documents to save yet. Please scan a document first.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Digitized Document as PDF", "Digitized_Document.pdf", "PDF Document (*.pdf)"
+        )
+        if not path:
+            return
+
+        if not path.lower().endswith(".pdf"):
+            path += ".pdf"
+
+        try:
+            combined_md = "\n\n---\n\n".join(self.all_pages_markdown)
+            title = self.latest_doc.get("title", "Digitized Document") if self.latest_doc else "Digitized Document"
+            ok = PDFExporter.markdown_to_pdf(combined_md, path, doc_title=title)
+            if ok:
+                self.status_bar.showMessage(f"Document successfully saved as PDF: {path}")
+                QMessageBox.information(self, "PDF Saved", f"Successfully saved PDF to:\n{path}")
+            else:
+                QMessageBox.critical(self, "Export Error", "Failed to generate PDF document.")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed to save PDF: {e}")
+
     def _export_document(self):
-        """Export digitized document as Markdown, HTML, JSON, or Plain Text."""
+        """Export digitized document as PDF, Markdown, HTML, JSON, or Plain Text."""
         if not self.all_pages_markdown:
             QMessageBox.information(self, "Export", "No scanned documents to export yet. Please scan a document first.")
             return
 
-        file_filter = "Markdown File (*.md);;HTML Document (*.html);;JSON Data (*.json);;Plain Text (*.txt)"
-        path, selected_filter = QFileDialog.getSaveFileName(self, "Export Digitized Document", "Digitized_Document", file_filter)
+        file_filter = "PDF Document (*.pdf);;Markdown File (*.md);;HTML Document (*.html);;JSON Data (*.json);;Plain Text (*.txt)"
+        path, selected_filter = QFileDialog.getSaveFileName(self, "Export Digitized Document", "Digitized_Document.pdf", file_filter)
 
         if not path:
             return
 
         try:
-            if "*.json" in selected_filter:
-                content = self.tab_json.toPlainText()
-            elif "*.html" in selected_filter:
-                content = self.tab_formatted.toHtml()
-            else:
-                content = self.tab_markdown.toPlainText()
+            combined_md = "\n\n---\n\n".join(self.all_pages_markdown)
+            title = self.latest_doc.get("title", "Digitized Document") if self.latest_doc else "Digitized Document"
 
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
+            if "*.pdf" in selected_filter or path.lower().endswith(".pdf"):
+                if not path.lower().endswith(".pdf"):
+                    path += ".pdf"
+                ok = PDFExporter.markdown_to_pdf(combined_md, path, doc_title=title)
+                if not ok:
+                    raise RuntimeError("Failed to generate PDF.")
+            elif "*.json" in selected_filter or path.lower().endswith(".json"):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(self.tab_json.toPlainText())
+            elif "*.html" in selected_filter or path.lower().endswith(".html"):
+                print_html = PDFExporter.markdown_to_print_html(combined_md, title)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(print_html)
+            else:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(self.tab_markdown.toPlainText())
 
             self.status_bar.showMessage(f"Document successfully exported to: {path}")
             QMessageBox.information(self, "Export Successful", f"Saved to:\n{path}")

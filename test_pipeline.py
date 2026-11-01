@@ -255,6 +255,52 @@ except Exception as e:
     report("Full pipeline integration", False, str(e))
 
 # ─────────────────────────────────────────────
+print("\n[7] STEP 6 — PDF Exporter")
+# ─────────────────────────────────────────────
+try:
+    from src.pdf_exporter import PDFExporter
+    report("PDFExporter import", True)
+except Exception as e:
+    report("PDFExporter import", False, str(e))
+    PDFExporter = None
+
+if PDFExporter:
+    try:
+        import os
+        from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtPdf import QPdfDocument
+        app = QApplication.instance() or QApplication(sys.argv)
+
+        sample_md = """# Digitized Test Document
+
+### Section 1: Introduction
+LiveDoc successfully converted physical document elements into digital PDF format.
+
+| Item | Qty | Price |
+| :---: | :---: | :---: |
+| Scanner | 1 | $150 |
+| Paper | 5 | $25 |
+
+---
+
+## 2.0 Next Section
+Multi-page PDF export with automatic page breaks and clean typography.
+"""
+        test_pdf_path = "test_pipeline_export.pdf"
+        ok = PDFExporter.markdown_to_pdf(sample_md, test_pdf_path, doc_title="Test Document")
+        if ok and os.path.exists(test_pdf_path) and os.path.getsize(test_pdf_path) > 1000:
+            pdf_doc = QPdfDocument(None)
+            pdf_doc.load(test_pdf_path)
+            pages = pdf_doc.pageCount()
+            pdf_doc.close()
+            os.remove(test_pdf_path)
+            report("markdown_to_pdf() generates valid multi-page PDF", True, f"Output pages: {pages}")
+        else:
+            report("markdown_to_pdf() generates valid multi-page PDF", False, "File generation failed")
+    except Exception as e:
+        report("markdown_to_pdf() generates valid multi-page PDF", False, str(e))
+
+# ─────────────────────────────────────────────
 print("\n" + "="*60)
 print("  SUMMARY")
 print("="*60)

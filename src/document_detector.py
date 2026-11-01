@@ -123,7 +123,7 @@ class DocumentDetector:
 
         small_h, small_w = small.shape[:2]
         small_area = small_h * small_w
-        min_doc_area = small_area * 0.15
+        min_doc_area = small_area * 0.45
         max_doc_area = small_area * 0.98
 
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
@@ -155,6 +155,41 @@ class DocumentDetector:
                     approx = cv2.approxPolyDP(c, eps * peri, True)
                     if len(approx) == 4 and cv2.isContourConvex(approx):
                         pts = (approx.reshape(4, 2) / scale).astype(int)
+                        rect = self._order_points(pts)
+                        w = np.linalg.norm(rect[1] - rect[0])
+                        h = np.linalg.norm(rect[3] - rect[0])
+                        aspect = max(w, h) / max(1.0, min(w, h))
+
+                        # Bounding span check: must span at least 55% of camera frame width and height
+                        min_x = np.min(rect[:, 0])
+                        max_x = np.max(rect[:, 0])
+                        min_y = np.min(rect[:, 1])
+                        max_y = np.max(rect[:, 1])
+                        span_w = (max_x - min_x) / float(orig_w)
+                        span_h = (max_y - min_y) / float(orig_h)
+
+                        if 1.05 <= aspect <= 2.2 and span_w >= 0.55 and span_h >= 0.55:
+                            return pts
+
+                # Fallback: if contour represents a document page (> 45% of frame)
+                # but has extra vertices due to thumb/finger or page curvature, use oriented minAreaRect
+                if area >= small_area * 0.45:
+                    rect = cv2.minAreaRect(c)
+                    box = cv2.boxPoints(rect)
+                    pts = (box / scale).astype(int)
+                    ordered = self._order_points(pts)
+                    w = np.linalg.norm(ordered[1] - ordered[0])
+                    h = np.linalg.norm(ordered[3] - ordered[0])
+                    aspect = max(w, h) / max(1.0, min(w, h))
+
+                    min_x = np.min(ordered[:, 0])
+                    max_x = np.max(ordered[:, 0])
+                    min_y = np.min(ordered[:, 1])
+                    max_y = np.max(ordered[:, 1])
+                    span_w = (max_x - min_x) / float(orig_w)
+                    span_h = (max_y - min_y) / float(orig_h)
+
+                    if 1.05 <= aspect <= 2.2 and span_w >= 0.55 and span_h >= 0.55:
                         return pts
 
         return None
@@ -165,9 +200,9 @@ class DocumentDetector:
         rect[0] = pts[np.argmin(s)]
         rect[2] = pts[np.argmax(s)]
 
-        diff = np.diff(pts, axis=1)
-        rect[1] = pts[np.argmin(diff)]
-        rect[3] = pts[np.argmax(diff)]
+        diff = pts[:, 0] - pts[:, 1]
+        rect[1] = pts[np.argmax(diff)]
+        rect[3] = pts[np.argmin(diff)]
         return rect
 
     def flatten_document(self, frame, corners):
