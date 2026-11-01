@@ -258,7 +258,7 @@ class OCREngine:
             if len(line) == 1:
                 t = line[0]
                 # High-confidence threshold for single-token lines unless it is a standard list bullet (e.g. '1.', 'A.', 'i)')
-                is_bullet = bool(re.match(r"^(\d+|[ivx]+|[a-z])[\.\)]$", t["text"].strip(), re.IGNORECASE))
+                is_bullet = bool(re.match(r"^(\d{1,2}|[ivx]{1,4}|[a-zA-Z])[\.\)]$", t["text"].strip()))
                 if not is_bullet:
                     if t["conf"] < 0.72 or t["min_x"] > 0.88 * W or (t["conf"] < 0.80 and t["w"] < 40):
                         continue

@@ -80,8 +80,9 @@ class LayoutAnalyzer:
         # -------------------------------------------------------------
         # 1. Detect Tables (orthogonal horizontal and vertical grid lines)
         # -------------------------------------------------------------
-        scale_h = max(15, w // 25)
-        scale_v = max(15, h // 30)
+        # Adapt kernel scales to detect both bold and thin/faint table borders
+        scale_h = max(12, w // 35)
+        scale_v = max(12, h // 40)
         h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (scale_h, 1))
         v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, scale_v))
 
@@ -89,12 +90,15 @@ class LayoutAnalyzer:
         v_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, v_kernel)
         table_grid = cv2.add(h_lines, v_lines)
 
-        table_cnts, _ = cv2.findContours(table_grid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Bridge subtle 1-2px junction breaks caused by camera illumination or perspective warping
+        grid_connect = cv2.dilate(table_grid, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+
+        table_cnts, _ = cv2.findContours(grid_connect, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         table_boxes = []
         for c in table_cnts:
             bx, by, bw, bh = cv2.boundingRect(c)
             # Table must have notable dimensions
-            if bw > (w * 0.18) and bh > (h * 0.05):
+            if bw > (w * 0.15) and bh > (h * 0.04):
                 # Tight bounding box to prevent eating preceding text
                 pad_x = 4
                 pad_y = 2
