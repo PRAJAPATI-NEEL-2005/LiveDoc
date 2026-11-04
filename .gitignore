@@ -35,6 +35,7 @@ ENV/
 .idea/
 *.swp
 *.swo
+.DS_Store
 
 # Large Model weights (downloaded at runtime)
 models/*.pt
