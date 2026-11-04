@@ -1,10 +1,18 @@
+import sys
 import cv2
+
+
+def _get_capture_backend():
+    """Use DirectShow for fast opening on Windows; default on macOS/Linux."""
+    return cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
+
 
 class LiveCameraManager:
     def __init__(self, camera_index=0):
         """Initialize the webcam connection."""
         self.camera_index = camera_index
-        self.cap = cv2.VideoCapture(camera_index)
+        backend = _get_capture_backend() if isinstance(camera_index, int) else cv2.CAP_ANY
+        self.cap = cv2.VideoCapture(camera_index, backend)
         
         # Check if the camera opened successfully
         if not self.cap.isOpened():
@@ -17,29 +25,34 @@ class LiveCameraManager:
         available cameras as (index, name) tuples.
         
         On Windows, cv2.VideoCapture only gives us an index, not a friendly
-        name, so we label them 'Camera 0', 'Camera 1', etc.  The user can
-        identify their Smart Connect / phone camera by trying each one.
+        name, so we label them 'Camera 0', 'Camera 1', etc. The user can
+        identify their phone / external camera by trying each one.
         """
+        backend = _get_capture_backend()
         available = []
         for idx in range(max_index):
-            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)   # DirectShow is faster on Windows
+            cap = cv2.VideoCapture(idx, backend)
             if cap.isOpened():
                 # Read one frame to confirm it's a real camera, not a stale handle
                 ret, _ = cap.read()
                 if ret:
-                    # Try to grab a human-readable backend name
                     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                     label = f"Camera {idx}  ({w}x{h})"
                     available.append((idx, label))
                 cap.release()
+            else:
+                # On macOS, camera indices are contiguous; break early if not found
+                if sys.platform != "win32" and idx > 0:
+                    break
         return available
 
     def switch_camera(self, camera_index):
         """Release the current camera and open a different one."""
         self.release()
         self.camera_index = camera_index
-        self.cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+        backend = _get_capture_backend() if isinstance(camera_index, int) else cv2.CAP_ANY
+        self.cap = cv2.VideoCapture(camera_index, backend)
         if not self.cap.isOpened():
             print(f"Error: Could not open camera {camera_index}.")
             return False
