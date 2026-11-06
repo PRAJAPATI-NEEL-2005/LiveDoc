@@ -46,33 +46,121 @@ LiveDoc features a versatile tri-mode processing engine that balances speed, pri
 
 ---
 
-## Key Capabilities & Pipeline
+## End-to-End System Workflow
 
+```mermaid
+flowchart TD
+    subgraph S1["1. Real-Time Camera & Positioning"]
+        CAM["Live Video Stream\n(Webcam / 1080p Mobile Cam)"] --> QC{"Quality Assessment"}
+        QC -->|"Blur (Var < 20)"| BLUR["[!] Hold Steady — Focus Incomplete"]
+        QC -->|"Glare (> 8%)"| GLARE["[!] Glare Detected — Adjust Angle"]
+        QC -->|"Sharp & Centered"| DET["4-Point Contour Lock & Perspective Warp"]
+    end
+
+    subgraph S2["2. Processing Mode Routing"]
+        DET --> MODE{"User Selected Mode"}
+        MODE -->|"Local (Offline)"| LOCAL_PATH["Offline CV + PaddleOCR Pipeline"]
+        MODE -->|"Smart AI"| AI_PATH["Multimodal Gemini Vision Pipeline"]
+        MODE -->|"Auto (Hybrid)"| AUTO_START["Fast Offline Scan & Complexity Analysis"]
+    end
+
+    subgraph S3["3. Auto-Escalation Decision Engine"]
+        AUTO_START --> VAL{"DocumentValidator\nComplexity Check"}
+        VAL -->|"Score >= 85% & Simple Layout"| LOCAL_PATH
+        VAL -->|"Math Syntax / Truth Tables / Multi-Figures"| AI_PATH
+    end
+
+    subgraph S4["4. Extraction & Reconstruction"]
+        LOCAL_PATH --> CV_DEC["Layout Decomposition\n(Tables, Figures, Headings, Text)"]
+        CV_DEC --> OCR_ENG["PaddleOCR Token & Line Clustering"]
+        OCR_ENG --> TBL_REC["2D Table Matrix & Typography Normalizer"]
+
+        AI_PATH --> GEMINI_POOL["High-Availability Model Pool\n(gemini-3.5-flash / lite / 3.6 / 3.8)"]
+        GEMINI_POOL --> FIG_CROP["Dynamic Figure Bounding-Box Grounding & Cropping"]
+        GEMINI_POOL --> LATEX_GEN["Full LaTeX Formula & Table Generation"]
+    end
+
+    subgraph S5["5. Output & Publication Export"]
+        TBL_REC --> DOC_VIEW["Interactive Multi-Tab Viewer\n(Formatted HTML, Markdown, JSON, Validation)"]
+        FIG_CROP --> DOC_VIEW
+        LATEX_GEN --> DOC_VIEW
+        DOC_VIEW --> PDF_EXP["Intelligent Auto-Fit PDF Exporter\n(Proportional Sizing, Font Scaling, LaTeX Typography)"]
+        PDF_EXP --> OUT_PDF["Publication-Grade A4 PDF"]
+        DOC_VIEW --> OUT_FILES["Export .MD / .HTML / .JSON"]
+    end
 ```
-┌─────────────────────────┐
-│   Live Camera Stream    │  (Webcam / 1080p Phone Cam, Threaded Ring Buffer)
-└────────────┬────────────┘
-             │
-┌────────────▼────────────┐
-│  Document Detection &   │  (Adaptive Edge Filtering, 4-Point Contour Lock,
-│ Perspective Correction  │   Warp Transform, Sharpness/Blur & Glare Checks)
-└────────────┬────────────┘
-             │
-┌────────────▼────────────┐
-│  Layout Decomposition   │  (Morphological Grid Detection: Tables, Figures,
-│                         │   Section Blocks, Running Header Banners)
-└────────────┬────────────┘
-             │
-┌────────────▼────────────┐
-│   Engine Transcription  │  (Local PaddleOCR + Table Matrix Reconstruction
-│                         │   OR Multimodal Gemini Vision AI)
-└────────────┬────────────┘
-             │
-┌────────────▼────────────┐
-│ Validation & Auto-Fit   │  (Confidence Auditing, Arithmetic Discrepancy,
-│   Publication Export    │   LaTeX Typography, Proportional Image Sizing, PDF)
-└─────────────────────────┘
+
+---
+
+## Detailed Pipeline Flowcharts
+
+### 1. Auto-Mode Decision & Escalation Flowchart
+
+Auto Mode balances execution speed, zero unnecessary API usage, and digitization accuracy through multi-metric complexity scoring:
+
+```mermaid
+flowchart TD
+    START["Captured Document Frame"] --> FAST_SCAN["Fast Local OCR & Contour Extraction"]
+    FAST_SCAN --> C1{"Symbolic Math Syntax?\n(Greek, LaTeX, Set Braces '{...}', Arrows '->', Equations)"}
+    C1 -->|"Yes"| ESCALATE["Auto-Escalate to Smart AI (Gemini)"]
+    C1 -->|"No"| C2{"Boolean / Truth Table?\n(>= 50% Cells are 'T', 'F', '0', '1')"}
+    C2 -->|"Yes"| ESCALATE
+    C2 -->|"No"| C3{"Infographic / Non-Linear?\n(> 35% Snippets <= 3 Words OR >= 2 Figures)"}
+    C3 -->|"Yes"| ESCALATE
+    C3 -->|"No"| C4{"False Table Grid?\n(> 25% Cells Contain Narrative Sentences)"}
+    C4 -->|"Yes"| ESCALATE
+    C4 -->|"No"| C5{"Composite Confidence < 85%?"}
+    C5 -->|"Yes"| ESCALATE
+    C5 -->|"No"| LOCAL_SUCCESS["Produce High-Speed Local Output\n(Zero Cloud API Cost)"]
+    ESCALATE --> AI_SUCCESS["Generate Human-Grade Output\n(Pristine LaTeX & Grounded Figures)"]
 ```
+
+---
+
+### 2. Smart AI Multi-Model Resilience & Fallback Flowchart
+
+LiveDoc guarantees continuous service availability even during Google Cloud traffic spikes:
+
+```mermaid
+flowchart LR
+    REQ["Digitization Request"] --> M1["1. gemini-3.5-flash\n(Primary, High Availability)"]
+    M1 -->|"Success"| DONE["Markdown & Grounded Figures"]
+    M1 -->|"503 / 429 / Error"| M2["2. gemini-3.5-flash-lite\n(Ultra-Fast Fallback)"]
+    M2 -->|"Success"| DONE
+    M2 -->|"503 / 429 / Error"| M3["3. gemini-3.6-flash\n(Secondary Backup)"]
+    M3 -->|"Success"| DONE
+    M3 -->|"503 / 429 / Error"| M4["4. gemini-3.8-flash\n(Preview Model)"]
+    M4 -->|"Success"| DONE
+    M4 -->|"All Models Busy"| LOCAL_FALLBACK["Seamless Offline Engine Fallback\n(Informs User, Zero Crash)"]
+```
+
+---
+
+### 3. Proportional Figure Sizing & PDF Auto-Fit Flowchart
+
+LiveDoc sizes figures dynamically and adjusts font sizes so each scanned page forms a self-contained, publication-ready PDF page without table splitting:
+
+```mermaid
+flowchart TD
+    MD["Markdown Content with Embedded Visuals"] --> IMG_CHK{"Image Type & Dimensions"}
+    IMG_CHK -->|"Logos / Barcodes / QR (H < 100px)"| COMPACT["Compact Scaling\nmax-height: 48px; max-width: 42%"]
+    IMG_CHK -->|"Multi-Diagram Page (>= 3 Figures)"| PROPORTIONAL["Balanced Multi-Figure Scaling\nmax-height: 105px - 115px"]
+    IMG_CHK -->|"Single Main Diagram (1 Figure)"| FULL["Full Resolution Display\nmax-height: 220px"]
+    IMG_CHK -->|"Inline Bullet Icon (<= 45x45px)"| SUPPRESS["Suppress Standalone Break"]
+
+    COMPACT --> FONT_FIT{"Auto-Fit Page Budget"}
+    PROPORTIONAL --> FONT_FIT
+    FULL --> FONT_FIT
+    SUPPRESS --> FONT_FIT
+
+    FONT_FIT -->|"Content Fits in 1 Page"| P1["Single A4 Page Output"]
+    FONT_FIT -->|"Content Slightly Exceeds"| SCALE_FONT["Step Down Font Size\n(9.2pt -> 8.8pt -> ... -> 7.2pt)"]
+    SCALE_FONT -->|"Achieved Min Pages"| P_FINAL["Balanced 1-2 Page PDF with Clean Header Badges"]
+```
+
+---
+
+## Core Pipeline Capabilities
 
 ### 1. Camera & Positioning Guidance (`src/camera_manager.py`, `src/document_detector.py`)
 - Background capture thread eliminating UI freezes.
