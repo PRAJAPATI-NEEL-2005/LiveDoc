@@ -228,12 +228,58 @@ class DocumentDetector:
         warped = cv2.warpPerspective(frame, M, (maxWidth, maxHeight))
         return warped
 
-    def preprocess_for_ocr(self, image):
+    def detect_skew_angle(self, image: np.ndarray) -> float:
         """
-        Gentle contrast normalization to ensure high dynamic range without eroding thin font strokes.
+        Universal document skew angle detection via probabilistic Hough lines.
+        Returns angle in degrees (-20 to +20). If tilt is negligible (< 1.0 deg), returns 0.0.
+        """
+        if image is None or image.size == 0:
+            return 0.0
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        h, w = gray.shape[:2]
+        scale = 960.0 / max(h, w) if max(h, w) > 960 else 1.0
+        if scale < 1.0:
+            small = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        else:
+            small = gray
+        edges = cv2.Canny(small, 50, 150, apertureSize=3)
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 80, minLineLength=80, maxLineGap=10)
+        if lines is not None:
+            angles = []
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+                if -20.0 < angle < 20.0:
+                    angles.append(angle)
+            if len(angles) >= 10:
+                med_angle = float(np.median(angles))
+                if abs(med_angle) >= 1.0:
+                    return med_angle
+        return 0.0
+
+    def deskew_document(self, image: np.ndarray) -> np.ndarray:
+        """
+        Deskews the document image if a tilt >= 1.0 degree is detected.
         """
         if image is None or image.size == 0:
             return image
+        angle = self.detect_skew_angle(image)
+        if abs(angle) >= 1.0:
+            h, w = image.shape[:2]
+            center = (w // 2, h // 2)
+            M = cv2.getRotationMatrix2D(center, angle, 1.0)
+            return cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
+        return image
+
+    def preprocess_for_ocr(self, image):
+        """
+        Gentle contrast normalization and universal deskewing without eroding thin font strokes.
+        """
+        if image is None or image.size == 0:
+            return image
+
+        # 1. Level document if tilted
+        image = self.deskew_document(image)
 
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
         norm = cv2.normalize(gray, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8UC1)

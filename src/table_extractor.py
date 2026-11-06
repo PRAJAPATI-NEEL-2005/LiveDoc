@@ -21,8 +21,8 @@ class TableExtractor:
         if not text:
             return ""
         t = text.strip()
-        # Escape pipe characters so Markdown table syntax remains valid
-        t = t.replace("|", "/")
+        # Escape pipe characters so Markdown table syntax remains valid without ugly slashes
+        t = t.replace("|", "│")
         # Strip trailing isolated footnote/page digits separated by space from short logic headers (e.g. "A^B 10" -> "A^B")
         t = re.sub(r"^([A-Za-z\~\^\v\-]{1,6})\s+\d{1,2}$", r"\1", t)
         return t
@@ -167,8 +167,7 @@ class TableExtractor:
             'through', 'before', 'after', 'above', 'below', 'up', 'down', 'out', 'on',
             'off', 'over', 'under', 'again', 'further', 'then', 'once', 'such', 'what',
             'which', 'who', 'whom', 'whose', 'when', 'where', 'why', 'how', 'all', 'any',
-            'both', 'each', 'few', 'more', 'most', 'other', 'some', 'conco', 'called',
-            'propos', 'piop', 'nositi', 'connective', 'proposition', 'propositions'
+            'both', 'each', 'few', 'more', 'most', 'other', 'some'
         }
 
         # Filter out stray rows that consist only of English prose stopwords
@@ -187,13 +186,13 @@ class TableExtractor:
         data_rows = grid[1:] if len(grid) > 1 else []
 
         # Clean headers: preserve authentic header text without injecting artificial Col_X tokens
-        clean_headers = [cls._clean_cell(c.replace("|", "/")).strip() for c in headers]
+        clean_headers = [cls._clean_cell(c.replace("|", "│")).strip() for c in headers]
         # If any header cell is empty, fill with standard non-disruptive label or space
         clean_headers = [c if c else " " for c in clean_headers]
 
         clean_rows = []
         for r in data_rows:
-            clean_rows.append([cls._clean_cell(c.replace("|", "/")).strip() for c in r])
+            clean_rows.append([cls._clean_cell(c.replace("|", "│")).strip() for c in r])
 
         # 4. Generate Centered Markdown Table
         md_lines = []

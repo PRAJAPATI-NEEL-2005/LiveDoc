@@ -151,6 +151,7 @@ class LayoutAnalyzer:
         h_lines = cv2.bitwise_or(h1, h2)
         v_lines = cv2.bitwise_or(v1, v2)
         table_grid = cv2.add(h_lines, v_lines)
+        intersections = cv2.bitwise_and(h_lines, v_lines)
 
         # Connect subtle cell junctions and corners
         grid_connect = cv2.dilate(table_grid, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
@@ -163,6 +164,20 @@ class LayoutAnalyzer:
             if bw > (w * 0.10) and bh > (h * 0.030):
                 # Ignore running header rule lines at the top of the page (aspect ratio > 6.0 touching top margin)
                 if by < 0.08 * h and (bw / float(max(1, bh))) > 5.5:
+                    continue
+
+                # Universal table grid condition:
+                # A genuine table must possess BOTH horizontal and vertical boundary lines
+                # and multiple intersecting cell junctions (corners).
+                # Isolated underlines, horizontal rules, or page borders have near-zero vertical lines and zero intersections.
+                box_h = h_lines[by:by+bh, bx:bx+bw]
+                box_v = v_lines[by:by+bh, bx:bx+bw]
+                box_x = intersections[by:by+bh, bx:bx+bw]
+                h_px = cv2.countNonZero(box_h)
+                v_px = cv2.countNonZero(box_v)
+                x_px = cv2.countNonZero(box_x)
+
+                if v_px < max(80, int(bh * 1.2)) or h_px < max(80, int(bw * 0.4)) or x_px < 8:
                     continue
 
                 # Tight bounding box to prevent eating preceding text
@@ -181,11 +196,41 @@ class LayoutAnalyzer:
         table_boxes.sort(key=lambda tb: tb["box"][1])
 
         # -------------------------------------------------------------
-        # 2. Text Segmentation (Clean mask excluding tables)
+        # 1.5 Detect Large Graphic Figures / Diagrams (Non-Table)
+        # -------------------------------------------------------------
+        fig_mask = closed_thresh.copy()
+        for tb in table_boxes:
+            x1, y1, x2, y2 = tb["box"]
+            fig_mask[max(0, y1 - 4):min(h, y2 + 4), max(0, x1 - 4):min(w, x2 + 4)] = 0
+
+        # Detect prominent non-text graphical contours (drawings, photos, charts)
+        fig_cnts, _ = cv2.findContours(fig_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        image_boxes = []
+        for c in fig_cnts:
+            bx, by, bw, bh = cv2.boundingRect(c)
+            # Must have notable dimensions in both axes (not thin individual text lines or standard paragraphs)
+            if bw > (w * 0.25) and bh > (h * 0.18) and (bw * bh) > (w * h * 0.05):
+                # Ignore whole page borders or margins
+                if bw > (w * 0.90) or bh > (h * 0.88):
+                    continue
+                # Reasonable aspect ratio for diagrams and illustrations
+                aspect = bw / float(max(1, bh))
+                if 0.25 <= aspect <= 4.0:
+                    image_boxes.append({
+                        "type": "Image",
+                        "box": [bx, by, bx + bw, by + bh]
+                    })
+        image_boxes = self._merge_overlapping_boxes(image_boxes, iou_thresh=0.25, contain_thresh=0.50)
+
+        # -------------------------------------------------------------
+        # 2. Text Segmentation (Clean mask excluding tables and images)
         # -------------------------------------------------------------
         text_thresh = thresh.copy()
         for tb in table_boxes:
             x1, y1, x2, y2 = tb["box"]
+            text_thresh[max(0, y1 - 4):min(h, y2 + 4), max(0, x1 - 4):min(w, x2 + 4)] = 0
+        for ib in image_boxes:
+            x1, y1, x2, y2 = ib["box"]
             text_thresh[max(0, y1 - 4):min(h, y2 + 4), max(0, x1 - 4):min(w, x2 + 4)] = 0
 
         # Horizontal dilation to connect words in a line
@@ -229,7 +274,7 @@ class LayoutAnalyzer:
                 "box": [px1, py1, px2, py2]
             })
 
-        all_blocks = table_boxes + text_blocks
+        all_blocks = table_boxes + image_boxes + text_blocks
         if not all_blocks:
             return [{"type": "Paragraph", "box": [0, 0, w, h]}]
 
