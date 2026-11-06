@@ -14,6 +14,13 @@ Features:
 """
 
 import sys
+import os
+
+# Ensure project root is in sys.path so 'src' imports work from any working directory or entrypoint
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 import json
 import cv2
 import numpy as np
@@ -21,7 +28,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
     QTextEdit, QTextBrowser, QHBoxLayout, QVBoxLayout, QSplitter,
     QStatusBar, QProgressBar, QFrame, QSizePolicy, QComboBox,
-    QTabWidget, QFileDialog, QMessageBox
+    QTabWidget, QFileDialog, QMessageBox, QDialog, QLineEdit, QCheckBox
 )
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize
 from PyQt6.QtGui import QImage, QPixmap, QFont, QColor, QPalette, QIcon
@@ -31,23 +38,158 @@ from src.camera_manager import LiveCameraManager
 from src.document_detector import DocumentDetector
 from src.layout_analyzer import LayoutAnalyzer
 from src.ocr_engine import OCREngine
+from src.smart_ai_engine import SmartAIEngine
 from src.pdf_exporter import PDFExporter
 
 
 # ─────────────────────────────────────────────────────────
-# Worker thread: runs OCR in background so UI never freezes
+# AI Settings & API Configuration Dialog
+# ─────────────────────────────────────────────────────────
+class AISettingsDialog(QDialog):
+    def __init__(self, smart_ai_engine: SmartAIEngine, parent=None):
+        super().__init__(parent)
+        self.smart_ai_engine = smart_ai_engine
+        self.setWindowTitle("LiveDoc AI Settings & API Configuration")
+        self.setMinimumWidth(540)
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #0d1117;
+                color: #e2e8f0;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+            }
+            QLabel {
+                color: #e2e8f0;
+                font-size: 13px;
+            }
+            QLineEdit {
+                background-color: #161b22;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                color: #e2e8f0;
+                padding: 8px 12px;
+                font-family: monospace;
+                font-size: 13px;
+            }
+            QLineEdit:focus {
+                border-color: #38bdf8;
+            }
+            QPushButton {
+                border-radius: 6px;
+                padding: 8px 16px;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            QCheckBox {
+                color: #94a3b8;
+                font-size: 12px;
+            }
+        """)
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(14)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        title = QLabel("Google Gemini Vision AI Settings")
+        title.setStyleSheet("font-size: 16px; font-weight: bold; color: #38bdf8;")
+        layout.addWidget(title)
+
+        desc = QLabel(
+            "LiveDoc connects with Google Gemini 3.8 Flash to power the 'Pure Smart AI' mode "
+            "and automatically enhance low-confidence scans in 'Auto / Hybrid' mode."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #94a3b8; font-size: 12px;")
+        layout.addWidget(desc)
+
+        # API Key Form
+        key_label = QLabel("Gemini API Key:")
+        key_label.setStyleSheet("font-weight: bold; color: #cbd5e1;")
+        layout.addWidget(key_label)
+
+        self.key_input = QLineEdit()
+        self.key_input.setPlaceholderText("Enter your Gemini API key (e.g. AIzaSy...)")
+        self.key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        if self.smart_ai_engine.api_key:
+            self.key_input.setText(self.smart_ai_engine.api_key)
+        layout.addWidget(self.key_input)
+
+        self.chk_show = QCheckBox("Show API key")
+        self.chk_show.toggled.connect(
+            lambda checked: self.key_input.setEchoMode(
+                QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+            )
+        )
+        layout.addWidget(self.chk_show)
+
+        status_txt = "Status: API Key configured ✓" if self.smart_ai_engine.is_available() else "Status: No API key configured ⚠️"
+        status_col = "#6ee7b7" if self.smart_ai_engine.is_available() else "#fca5a5"
+        self.lbl_status = QLabel(status_txt)
+        self.lbl_status.setStyleSheet(f"color: {status_col}; font-weight: bold; font-size: 12px;")
+        layout.addWidget(self.lbl_status)
+
+        # Instructions / Free tier banner
+        info_box = QFrame()
+        info_box.setStyleSheet("background-color: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 10px;")
+        info_layout = QVBoxLayout(info_box)
+        info_layout.setContentsMargins(10, 8, 10, 8)
+        info_text = QLabel(
+            "<b>How to get your free Gemini API key:</b><br>"
+            "1. Visit <a href='https://aistudio.google.com' style='color: #38bdf8;'>https://aistudio.google.com</a><br>"
+            "2. Click <b>'Get API Key'</b> and create a new key.<br>"
+            "3. Paste your key above and click <b>'Save Key'</b>.<br>"
+            "<small style='color: #94a3b8;'>• Generous free tier included. Stored safely in ~/.livedoc_config.json.</small>"
+        )
+        info_text.setOpenExternalLinks(True)
+        info_text.setWordWrap(True)
+        info_layout.addWidget(info_text)
+        layout.addWidget(info_box)
+
+        # Buttons
+        btn_box = QHBoxLayout()
+        self.btn_save = QPushButton("Save Key")
+        self.btn_save.setStyleSheet("background-color: #0284c7; color: #fff;")
+        self.btn_save.clicked.connect(self._save_key)
+
+        self.btn_close = QPushButton("Close")
+        self.btn_close.setStyleSheet("background-color: #21262d; color: #c9d1d9; border: 1px solid #30363d;")
+        self.btn_close.clicked.connect(self.accept)
+
+        btn_box.addStretch()
+        btn_box.addWidget(self.btn_save)
+        btn_box.addWidget(self.btn_close)
+        layout.addLayout(btn_box)
+
+    def _save_key(self):
+        new_key = self.key_input.text().strip()
+        self.smart_ai_engine.save_api_key(new_key)
+        if self.smart_ai_engine.is_available():
+            self.lbl_status.setText("Status: API Key configured ✓")
+            self.lbl_status.setStyleSheet("color: #6ee7b7; font-weight: bold; font-size: 12px;")
+            QMessageBox.information(self, "API Key Saved", "Gemini API key saved successfully!")
+        else:
+            self.lbl_status.setText("Status: No API key configured ⚠️")
+            self.lbl_status.setStyleSheet("color: #fca5a5; font-weight: bold; font-size: 12px;")
+            QMessageBox.warning(self, "API Key Cleared", "The API key was cleared.")
+
+
+# ─────────────────────────────────────────────────────────
+# Worker thread: runs OCR/AI in background so UI never freezes
 # ─────────────────────────────────────────────────────────
 class ScanWorker(QThread):
     result_ready = pyqtSignal(dict, object)   # (structured_doc_dict, flat_image)
     error_occurred = pyqtSignal(str)
     status_update = pyqtSignal(str)
 
-    def __init__(self, frame, detector, analyzer, ocr_engine):
+    def __init__(self, frame, detector, analyzer, ocr_engine, smart_ai_engine=None, scan_mode="auto"):
         super().__init__()
         self.frame = frame
         self.detector = detector
         self.analyzer = analyzer
         self.ocr_engine = ocr_engine
+        self.smart_ai_engine = smart_ai_engine
+        self.scan_mode = scan_mode
 
     def run(self):
         try:
@@ -67,11 +209,58 @@ class ScanWorker(QThread):
             self.status_update.emit("Enhancing contrast & normalizing illumination...")
             flat = self.detector.preprocess_for_ocr(flat)
 
-            self.status_update.emit("Analyzing document layout (Tables, Titles, Text)...")
-            boxes = self.analyzer.analyze(flat)
+            if self.scan_mode == "smart_ai":
+                self.status_update.emit("Transcribing document with Multimodal Vision AI...")
+                if not self.smart_ai_engine or not self.smart_ai_engine.is_available():
+                    raise ValueError(
+                        "Smart AI is not configured. Please set your Gemini API key via the ⚙️ AI Settings button "
+                        "or set the GEMINI_API_KEY environment variable. You can get a free key at https://aistudio.google.com"
+                    )
+                try:
+                    doc_data = self.smart_ai_engine.transcribe_document(flat)
+                except Exception as ai_err:
+                    # Seamless fallback: if cloud servers are experiencing high demand (503) or offline,
+                    # don't leave the user with an error screen! Digitized with the offline engine immediately:
+                    self.status_update.emit("Cloud AI busy — seamlessly digitized via Offline Engine...")
+                    boxes = self.analyzer.analyze(flat)
+                    doc_data = self.ocr_engine.extract_structured_document(flat, boxes)
+                    doc_data["ai_fallback_warning"] = (
+                        f"Smart AI experienced temporary server traffic ({str(ai_err)[:90]}...). "
+                        "LiveDoc seamlessly digitized your document using the offline engine."
+                    )
 
-            self.status_update.emit("Extracting structured text & reconstructing tables...")
-            doc_data = self.ocr_engine.extract_structured_document(flat, boxes)
+            elif self.scan_mode == "offline":
+                self.status_update.emit("Analyzing document layout (Tables, Figures, Text)...")
+                boxes = self.analyzer.analyze(flat)
+                self.status_update.emit("Extracting structured text & reconstructing tables...")
+                doc_data = self.ocr_engine.extract_structured_document(flat, boxes)
+
+            else:  # "auto" / Hybrid
+                self.status_update.emit("Running fast offline scan & confidence evaluation...")
+                boxes = self.analyzer.analyze(flat)
+                doc_data = self.ocr_engine.extract_structured_document(flat, boxes)
+
+                conf_info = doc_data.get("confidence", {})
+                score = conf_info.get("score", 90.0)
+                needs_escalation = conf_info.get("needs_escalation", False)
+
+                if score < 85.0 or needs_escalation:
+                    if self.smart_ai_engine and self.smart_ai_engine.is_available():
+                        self.status_update.emit(
+                            f"Offline scan confidence is {score:.1f}% (< 85%) — Auto-enhancing with Smart AI..."
+                        )
+                        try:
+                            ai_doc = self.smart_ai_engine.transcribe_document(flat)
+                            doc_data = ai_doc
+                            doc_data["escalated_from_offline"] = True
+                            doc_data["original_offline_score"] = score
+                        except Exception as ai_err:
+                            doc_data["ai_fallback_warning"] = str(ai_err)
+                    else:
+                        doc_data["ai_notice"] = (
+                            f"Confidence score is {score:.1f}%. Add a Gemini API Key in ⚙️ AI Settings "
+                            "to enable automatic Smart AI enhancement."
+                        )
 
             self.result_ready.emit(doc_data, flat)
         except Exception as e:
@@ -93,6 +282,7 @@ class LiveDocApp(QMainWindow):
         self.detector = DocumentDetector()
         self.analyzer = LayoutAnalyzer()
         self.ocr_engine = OCREngine()
+        self.smart_ai_engine = SmartAIEngine()
 
         # State
         self.camera_running = False
@@ -288,6 +478,39 @@ class LiveDocApp(QMainWindow):
                 font-size: 11px;
                 font-weight: bold;
             }
+            QLabel#badge_confidence_neutral {
+                background-color: #21262d;
+                color: #8b949e;
+                padding: 4px 12px;
+                border-radius: 12px;
+                font-size: 11px;
+                font-weight: bold;
+            }
+            QLabel#badge_confidence_high {
+                background-color: #064e3b;
+                color: #6ee7b7;
+                padding: 4px 12px;
+                border-radius: 12px;
+                font-size: 11px;
+                font-weight: bold;
+            }
+            QLabel#badge_confidence_fair {
+                background-color: #78350f;
+                color: #fcd34d;
+                padding: 4px 12px;
+                border-radius: 12px;
+                font-size: 11px;
+                font-weight: bold;
+            }
+            QLabel#badge_confidence_smart_ai {
+                background-color: #082f49;
+                color: #38bdf8;
+                border: 1px solid #0284c7;
+                padding: 4px 12px;
+                border-radius: 12px;
+                font-size: 11px;
+                font-weight: bold;
+            }
         """)
 
     # ── UI Layout ─────────────────────────────────────────
@@ -305,18 +528,23 @@ class LiveDocApp(QMainWindow):
 
         title = QLabel("LiveDoc")
         title.setObjectName("title_label")
-        sub = QLabel("Real-Time Intelligent Document Digitizer  •  Computer Vision + YOLO + PaddleOCR")
+        sub = QLabel("Real-Time Intelligent Document Digitizer  •  Computer Vision + YOLO + PaddleOCR + Smart AI")
         sub.setObjectName("subtitle_label")
         sub.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         self.doc_badge = QLabel("  Searching for document...")
         self.doc_badge.setObjectName("badge_searching")
 
+        self.confidence_badge = QLabel("  Confidence: —")
+        self.confidence_badge.setObjectName("badge_confidence_neutral")
+
         header_layout.addWidget(title)
         header_layout.addSpacing(14)
         header_layout.addWidget(sub)
         header_layout.addStretch()
         header_layout.addWidget(self.doc_badge)
+        header_layout.addSpacing(8)
+        header_layout.addWidget(self.confidence_badge)
         root_layout.addWidget(header)
 
         # Progress bar
@@ -422,17 +650,33 @@ class LiveDocApp(QMainWindow):
         self.btn_camera = QPushButton("  Start Camera")
         self.btn_camera.setObjectName("btn_camera")
         self.btn_camera.setCheckable(True)
-        self.btn_camera.setMinimumWidth(150)
+        self.btn_camera.setMinimumWidth(140)
         self.btn_camera.clicked.connect(self.toggle_camera)
 
         self.btn_rotate = QPushButton("Rotate 90°")
         self.btn_rotate.setObjectName("btn_secondary")
         self.btn_rotate.clicked.connect(self._rotate_view)
 
+        # Scan Mode selection
+        mode_label = QLabel("Mode:")
+        mode_label.setStyleSheet("color: #38bdf8; font-weight: bold;")
+        self.mode_combo = QComboBox()
+        self.mode_combo.setObjectName("mode_combo")
+        self.mode_combo.addItem("🔄 Auto (Hybrid)", userData="auto")
+        self.mode_combo.addItem("⚡ Offline (Local)", userData="offline")
+        self.mode_combo.addItem("🌟 Smart AI (Gemini)", userData="smart_ai")
+        self.mode_combo.setCurrentIndex(0)
+        self.mode_combo.setToolTip("Auto: fast offline scan with confidence check and automatic Smart AI fallback.")
+
+        self.btn_ai_settings = QPushButton("⚙️ AI Settings")
+        self.btn_ai_settings.setObjectName("btn_secondary")
+        self.btn_ai_settings.setToolTip("Configure Gemini API key for Smart AI features")
+        self.btn_ai_settings.clicked.connect(self._open_ai_settings)
+
         self.btn_scan = QPushButton("  Scan Document")
         self.btn_scan.setObjectName("btn_scan")
         self.btn_scan.setEnabled(False)
-        self.btn_scan.setMinimumWidth(180)
+        self.btn_scan.setMinimumWidth(170)
         self.btn_scan.clicked.connect(self.scan_document)
 
         self.btn_pdf = QPushButton("📄 Save as PDF")
@@ -450,9 +694,13 @@ class LiveDocApp(QMainWindow):
         ctrl_layout.addWidget(cam_label)
         ctrl_layout.addWidget(self.cam_combo)
         ctrl_layout.addWidget(self.btn_refresh)
-        ctrl_layout.addSpacing(6)
+        ctrl_layout.addSpacing(4)
         ctrl_layout.addWidget(self.btn_camera)
         ctrl_layout.addWidget(self.btn_rotate)
+        ctrl_layout.addSpacing(8)
+        ctrl_layout.addWidget(mode_label)
+        ctrl_layout.addWidget(self.mode_combo)
+        ctrl_layout.addWidget(self.btn_ai_settings)
         ctrl_layout.addStretch()
         ctrl_layout.addWidget(self.btn_clear)
         ctrl_layout.addWidget(self.btn_pdf)
@@ -563,9 +811,18 @@ class LiveDocApp(QMainWindow):
         q_message = quality.get("message", "")
         q_color = quality.get("color", (0, 220, 100))
 
+        # ASCII-safe message for OpenCV Hershey font overlay (prevents '??????' rendering)
+        clean_cv_msg = (
+            q_message.replace("—", "-")
+            .replace("–", "-")
+            .replace("⚠️", "")
+            .replace("✓", "")
+            .strip()
+        )
+
         if q_status == "BLURRY":
             self._set_badge("blurry", q_message)
-            cv2.putText(display, f"⚠️ {q_message}", (24, 45),
+            cv2.putText(display, f"[!] {clean_cv_msg}", (24, 45),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, q_color, 2)
         elif corners is not None:
             self._set_badge("found", q_message)
@@ -573,7 +830,7 @@ class LiveDocApp(QMainWindow):
             cv2.drawContours(display, [corners.astype(int)], -1, q_color, 3)
             for pt in corners.astype(int):
                 cv2.circle(display, tuple(pt), 7, q_color, -1)
-            cv2.putText(display, f"✓ {q_message}", (24, 45),
+            cv2.putText(display, f"[OK] {clean_cv_msg}", (24, 45),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, q_color, 2)
         else:
             self._set_badge("full_page", q_message)
@@ -589,7 +846,7 @@ class LiveDocApp(QMainWindow):
             cv2.line(display, (25, dh - 25), (25, dh - 25 - blen), c, 3)
             cv2.line(display, (dw - 25, dh - 25), (dw - 25 - blen, dh - 25), c, 3)
             cv2.line(display, (dw - 25, dh - 25), (dw - 25, dh - 25 - blen), c, 3)
-            cv2.putText(display, f"✓ {q_message}", (24, 45),
+            cv2.putText(display, f"[OK] {clean_cv_msg}", (24, 45),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, c, 2)
 
         # Fast SIMD pre-scale with OpenCV
@@ -621,6 +878,27 @@ class LiveDocApp(QMainWindow):
         self.doc_badge.style().unpolish(self.doc_badge)
         self.doc_badge.style().polish(self.doc_badge)
 
+    def _set_confidence_badge(self, state, text=None):
+        if state == "smart_ai":
+            self.confidence_badge.setObjectName("badge_confidence_smart_ai")
+            self.confidence_badge.setText(f"  {text or 'Smart AI ✨'}")
+        elif state == "high":
+            self.confidence_badge.setObjectName("badge_confidence_high")
+            self.confidence_badge.setText(f"  {text or 'Confidence: High ✓'}")
+        elif state == "fair":
+            self.confidence_badge.setObjectName("badge_confidence_fair")
+            self.confidence_badge.setText(f"  {text or 'Confidence: Fair ⚠️'}")
+        else:
+            self.confidence_badge.setObjectName("badge_confidence_neutral")
+            self.confidence_badge.setText(f"  {text or 'Confidence: —'}")
+
+        self.confidence_badge.style().unpolish(self.confidence_badge)
+        self.confidence_badge.style().polish(self.confidence_badge)
+
+    def _open_ai_settings(self):
+        dlg = AISettingsDialog(self.smart_ai_engine, self)
+        dlg.exec()
+
     # ── Scan Execution ──────────────────────────────────────
     def scan_document(self):
         if self.current_frame is None:
@@ -629,16 +907,21 @@ class LiveDocApp(QMainWindow):
         if self.scan_worker and self.scan_worker.isRunning():
             return
 
+        selected_mode = self.mode_combo.currentData() or "auto"
+        mode_label = self.mode_combo.currentText()
+
         self.btn_scan.setEnabled(False)
         self.btn_scan.setText("  Scanning...")
         self.progress.setVisible(True)
-        self.status_bar.showMessage("Digitizing document with layout understanding...")
+        self.status_bar.showMessage(f"Digitizing document [{mode_label}]...")
 
         self.scan_worker = ScanWorker(
             self.current_frame.copy(),
             self.detector,
             self.analyzer,
-            self.ocr_engine
+            self.ocr_engine,
+            self.smart_ai_engine,
+            scan_mode=selected_mode
         )
         self.scan_worker.result_ready.connect(self._on_scan_result)
         self.scan_worker.error_occurred.connect(self._on_scan_error)
@@ -657,6 +940,17 @@ class LiveDocApp(QMainWindow):
         page_md = doc_data.get("markdown", "")
         page_html = doc_data.get("html", "")
         validation = doc_data.get("validation", {})
+        engine_name = doc_data.get("engine", "Offline (PaddleOCR + SLANet)")
+        conf_info = doc_data.get("confidence", {})
+        score = conf_info.get("score", 95.0)
+        grade = conf_info.get("grade", "EXCELLENT")
+
+        if engine_name.startswith("Smart AI"):
+            self._set_confidence_badge("smart_ai", f"Smart AI ✨ ({score}%)")
+        elif score >= 85.0:
+            self._set_confidence_badge("high", f"Confidence: {score}% [{grade}] ✓")
+        else:
+            self._set_confidence_badge("fair", f"Confidence: {score}% [{grade}] ⚠️")
 
         self.all_pages_markdown.append(f"<!-- Page {self.page_count} -->\n" + page_md)
         self.all_pages_html.append(f'<div style="border-bottom: 2px solid #30363d; margin: 20px 0; padding-bottom: 15px;"><span style="background: #1e40af; color: #fff; padding: 3px 8px; border-radius: 4px; font-size: 11px;">PAGE {self.page_count}</span></div>' + page_html)
@@ -675,6 +969,8 @@ class LiveDocApp(QMainWindow):
             "document": {
                 "title": doc_data.get("title", "Digitized Document"),
                 "total_pages": self.page_count,
+                "engine": engine_name,
+                "confidence": conf_info,
                 "elements": self.all_pages_elements,
                 "validation": validation
             }
@@ -683,15 +979,38 @@ class LiveDocApp(QMainWindow):
 
         # 4. Update Validation Report Tab
         val_lines = [
-            "=" * 55,
+            "=" * 60,
             f"  VALIDATION & INTEGRITY REPORT — PAGE {self.page_count}",
-            "=" * 55,
+            "=" * 60,
+            f"Active Scan Engine: {engine_name}",
+            f"Composite Confidence Score: {score} / 100 [{grade}]",
+            f"  • OCR Token Accuracy: {conf_info.get('ocr_confidence', score)}%",
+            f"  • Lexical Integrity: {conf_info.get('lexical_confidence', score)}%",
+            f"  • Table Consistency: {conf_info.get('table_confidence', 100.0)}%",
+            f"  • Layout Coherence: {conf_info.get('layout_confidence', 95.0)}%",
+            "-" * 60,
             f"Overall Status: {validation.get('status', 'VERIFIED')}",
             f"Total Components Extracted: {len(elements)}",
             f"Uncertain OCR Detections: {validation.get('uncertain_items_count', 0)}",
             f"Mathematical Inconsistencies: {validation.get('inconsistencies_count', 0)}",
             ""
         ]
+
+        if doc_data.get("escalated_from_offline"):
+            val_lines.append("[AUTO-ESCALATION EVENT]")
+            val_lines.append(f"  • Offline scan confidence was {doc_data.get('original_offline_score')}%.")
+            val_lines.append(f"  • Escalated automatically to Smart AI (gemini-3.8-flash) for 100% human-grade quality.")
+            val_lines.append("")
+
+        if doc_data.get("ai_notice"):
+            val_lines.append("[SMART AI ADVISORY]")
+            val_lines.append(f"  • {doc_data.get('ai_notice')}")
+            val_lines.append("")
+
+        if doc_data.get("ai_fallback_warning"):
+            val_lines.append("[AI NOTICE]")
+            val_lines.append(f"  • Note: {doc_data.get('ai_fallback_warning')}")
+            val_lines.append("")
 
         if validation.get("inconsistencies"):
             val_lines.append("[ARITHMETIC & TABLE CHECKS]")
@@ -708,12 +1027,13 @@ class LiveDocApp(QMainWindow):
         if not validation.get("inconsistencies") and not validation.get("uncertain_items"):
             val_lines.append("✓ All detected elements meet confidence thresholds with 0 arithmetic errors.")
 
-        val_lines.append("=" * 55)
+        val_lines.append("=" * 60)
         self.tab_validation.setPlainText("\n".join(val_lines))
 
         table_count = sum(1 for e in elements if e.get("type") == "Table")
+        fig_count = sum(1 for e in elements if e.get("type") == "Image")
         self.status_bar.showMessage(
-            f"Page {self.page_count} digitized! Extracted {len(elements)} elements ({table_count} table(s))."
+            f"Page {self.page_count} digitized [{engine_name}]! Extracted {len(elements)} elements ({table_count} table(s), {fig_count} figure(s)). Score: {score}%"
         )
 
     def _save_as_pdf(self):

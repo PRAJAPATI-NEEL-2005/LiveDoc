@@ -42,3 +42,8 @@ models/*.pt
 models/*.pth
 models/*.onnx
 !models/.gitkeep
+
+# Generated figures and user configs
+documents/figures/
+config.json
+anaconda_projects/
