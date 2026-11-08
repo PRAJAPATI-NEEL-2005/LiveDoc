@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
     QTextEdit, QTextBrowser, QHBoxLayout, QVBoxLayout, QSplitter,
     QStatusBar, QProgressBar, QFrame, QSizePolicy, QComboBox,
-    QTabWidget, QFileDialog, QMessageBox, QDialog, QLineEdit, QCheckBox
+    QTabWidget, QFileDialog, QMessageBox, QDialog, QLineEdit, QCheckBox, QScrollArea
 )
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize
 from PyQt6.QtGui import QImage, QPixmap, QFont, QColor, QPalette, QIcon
@@ -218,6 +218,13 @@ class ScanWorker(QThread):
                     )
                 try:
                     doc_data = self.smart_ai_engine.transcribe_document(flat)
+                    # Supplement with OCR token coordinates for Dual-Layer Searchable PDF positioning
+                    if not doc_data.get("tokens") and self.ocr_engine:
+                        try:
+                            raw_ocr, _ = self.ocr_engine._get_best_ocr(flat)
+                            doc_data["tokens"] = self.ocr_engine._parse_tokens(raw_ocr)
+                        except Exception:
+                            pass
                 except Exception as ai_err:
                     # Seamless fallback: if cloud servers are experiencing high demand (503) or offline,
                     # don't leave the user with an error screen! Digitized with the offline engine immediately:
@@ -251,6 +258,8 @@ class ScanWorker(QThread):
                         )
                         try:
                             ai_doc = self.smart_ai_engine.transcribe_document(flat)
+                            if not ai_doc.get("tokens") and doc_data.get("tokens"):
+                                ai_doc["tokens"] = doc_data["tokens"]
                             doc_data = ai_doc
                             doc_data["escalated_from_offline"] = True
                             doc_data["original_offline_score"] = score
@@ -299,6 +308,7 @@ class LiveDocApp(QMainWindow):
         self.all_pages_markdown = []
         self.all_pages_html = []
         self.all_pages_elements = []
+        self.all_pages_data = []
 
         self._apply_stylesheet()
         self._build_ui()
@@ -589,6 +599,17 @@ class LiveDocApp(QMainWindow):
         result_layout.addWidget(res_header)
 
         self.tabs = QTabWidget()
+
+        # Tab 0: Physical Document View (2D Visual Layout with exact element bounding boxes)
+        self.tab_visual_scroll = QScrollArea()
+        self.tab_visual_scroll.setWidgetResizable(True)
+        self.tab_visual_scroll.setStyleSheet("background-color: #161b22; border: none;")
+        self.tab_visual_label = QLabel()
+        self.tab_visual_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.tab_visual_label.setText("Physical document layout with exact 2D element coordinates will render here after scanning...")
+        self.tab_visual_label.setStyleSheet("color: #94a3b8; font-size: 13px; padding: 25px;")
+        self.tab_visual_scroll.setWidget(self.tab_visual_label)
+        self.tabs.addTab(self.tab_visual_scroll, "  Visual 2D Layout  ")
 
         # Tab 1: Formatted Document (Rich HTML)
         self.tab_formatted = QTextBrowser()
@@ -944,6 +965,63 @@ class LiveDocApp(QMainWindow):
         self.scan_worker.status_update.connect(self.status_bar.showMessage)
         self.scan_worker.start()
 
+    def _render_annotated_document(self, flat_img: np.ndarray, elements: list, tokens: list):
+        """
+        Renders a crystal-clear 2D annotated visualization of the scanned physical document:
+        - 🟢 Green Bounding Box: Structured Tables
+        - 🟠 Orange Bounding Box: Visual Figures / Diagrams
+        - 🔵 Blue Bounding Box: Document Title & Headings
+        - 🟣 Purple / Slate Box: Text Paragraphs
+        Allows users to visually verify that 100% of physical positions are captured.
+        """
+        try:
+            vis = flat_img.copy()
+            H, W = vis.shape[:2]
+
+            # Draw element boxes
+            for el in elements:
+                el_type = el.get("type", "Paragraph")
+                box = el.get("box")
+                if not box or len(box) < 4:
+                    continue
+                x1, y1, x2, y2 = map(int, box[:4])
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(W - 1, x2), min(H - 1, y2)
+
+                if el_type == "Table":
+                    color = (0, 220, 80)      # Bright Green
+                    label = f"Table ({len(el.get('rows', []))} rows)"
+                elif el_type in ("Image", "Figure", "Picture"):
+                    color = (0, 140, 255)     # Vibrant Orange
+                    label = "Figure / Diagram"
+                elif el_type in ("Title", "Heading"):
+                    color = (255, 180, 0)     # Sky Blue
+                    label = f"{el_type}"
+                else:
+                    color = (200, 100, 180)   # Purple
+                    label = "Paragraph"
+
+                # Draw bounding outline
+                cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+                # Badge header
+                badge_h = 20
+                badge_w = min(150, max(60, len(label) * 9 + 10))
+                cv2.rectangle(vis, (x1, max(0, y1 - badge_h)), (min(W, x1 + badge_w), y1), color, -1)
+                cv2.putText(vis, label, (x1 + 4, max(14, y1 - 5)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+
+            # Resize to fit scroll area comfortably
+            target_w = max(550, min(850, self.tab_visual_scroll.width() - 25))
+            scale = target_w / float(W)
+            target_h = max(100, int(H * scale))
+            resized = cv2.resize(vis, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+            qimg = QImage(rgb.data, target_w, target_h, 3 * target_w, QImage.Format.Format_RGB888)
+            self.tab_visual_label.setPixmap(QPixmap.fromImage(qimg))
+            self.tab_visual_label.setText("")
+        except Exception as e:
+            print(f"Error rendering visual document: {e}")
+
     def _on_scan_result(self, doc_data, flat_img):
         self.progress.setVisible(False)
         self.btn_scan.setEnabled(True)
@@ -971,6 +1049,19 @@ class LiveDocApp(QMainWindow):
         self.all_pages_markdown.append(f"<!-- Page {self.page_count} -->\n" + page_md)
         self.all_pages_html.append(f'<div style="border-bottom: 2px solid #30363d; margin: 20px 0; padding-bottom: 15px;"><span style="background: #1e40af; color: #fff; padding: 3px 8px; border-radius: 4px; font-size: 11px;">PAGE {self.page_count}</span></div>' + page_html)
         self.all_pages_elements.extend(elements)
+        self.all_pages_data.append({
+            "image": flat_img.copy() if flat_img is not None else None,
+            "tokens": doc_data.get("tokens", []),
+            "elements": elements,
+            "title": doc_data.get("title", f"Page {self.page_count}"),
+            "markdown": page_md,
+            "html": page_html,
+            "page_num": self.page_count
+        })
+
+        # 0. Update Visual 2D Document Layout Tab
+        if flat_img is not None:
+            self._render_annotated_document(flat_img, elements, doc_data.get("tokens", []))
 
         # 1. Update Formatted Document Tab
         combined_html = "".join(self.all_pages_html)
@@ -1070,6 +1161,21 @@ class LiveDocApp(QMainWindow):
         try:
             combined_md = "\n\n---\n\n".join(self.all_pages_markdown)
             title = self.latest_doc.get("title", "Digitized Document") if self.latest_doc else "Digitized Document"
+
+            # Check if page images and tokens are available for Solution A: Dual-Layer Searchable PDF
+            has_images = any(p.get("image") is not None for p in self.all_pages_data)
+            if has_images:
+                ok = PDFExporter.create_searchable_pdf(self.all_pages_data, path, doc_title=title)
+                if ok:
+                    self.status_bar.showMessage(f"Dual-Layer Searchable PDF successfully saved: {path}")
+                    QMessageBox.information(
+                        self, "PDF Saved",
+                        f"Successfully saved Dual-Layer Searchable PDF to:\n{path}\n\n"
+                        "• 100% exact physical layout, tables & diagrams preserved\n"
+                        "• Selectable, copy-pasteable and searchable text (Ctrl+F)"
+                    )
+                    return
+
             ok = PDFExporter.markdown_to_pdf(combined_md, path, doc_title=title)
             if ok:
                 self.status_bar.showMessage(f"Document successfully saved as PDF: {path}")
@@ -1098,7 +1204,11 @@ class LiveDocApp(QMainWindow):
             if "*.pdf" in selected_filter or path.lower().endswith(".pdf"):
                 if not path.lower().endswith(".pdf"):
                     path += ".pdf"
-                ok = PDFExporter.markdown_to_pdf(combined_md, path, doc_title=title)
+                has_images = any(p.get("image") is not None for p in self.all_pages_data)
+                if has_images:
+                    ok = PDFExporter.create_searchable_pdf(self.all_pages_data, path, doc_title=title)
+                else:
+                    ok = PDFExporter.markdown_to_pdf(combined_md, path, doc_title=title)
                 if not ok:
                     raise RuntimeError("Failed to generate PDF.")
             elif "*.json" in selected_filter or path.lower().endswith(".json"):
@@ -1125,6 +1235,9 @@ class LiveDocApp(QMainWindow):
         self.all_pages_markdown = []
         self.all_pages_html = []
         self.all_pages_elements = []
+        self.all_pages_data = []
+        self.tab_visual_label.setPixmap(QPixmap())
+        self.tab_visual_label.setText("Physical document layout with exact 2D element coordinates will render here after scanning...")
         self.page_count = 0
         self.status_bar.showMessage("Results cleared.")
 

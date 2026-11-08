@@ -810,12 +810,17 @@ class OCREngine:
                 text_block = "\n\n".join(assembled_lines).strip()
                 if text_block:
                     avg_c = float(np.mean([t["conf"] for t in curr_para_tokens])) if curr_para_tokens else 1.0
+                    pbx1 = int(min(t["min_x"] for t in curr_para_tokens)) if curr_para_tokens else 0
+                    pby1 = int(min(t["min_y"] for t in curr_para_tokens)) if curr_para_tokens else int(curr_para_y)
+                    pbx2 = int(max(t["max_x"] for t in curr_para_tokens)) if curr_para_tokens else W
+                    pby2 = int(max(t["max_y"] for t in curr_para_tokens)) if curr_para_tokens else int(curr_para_y + 20)
                     structured_elements.append({
                         "type": "Paragraph",
                         "text": text_block,
                         "content": text_block,
                         "confidence": avg_c,
-                        "top_y": curr_para_y
+                        "top_y": curr_para_y,
+                        "box": [pbx1, pby1, pbx2, pby2]
                     })
                 curr_para_lines = []
                 curr_para_tokens = []
@@ -879,12 +884,17 @@ class OCREngine:
                 ]
                 header_text = "  •  ".join(t["text"].strip() for t in line)
                 header_text = self._clean_text_spacing(header_text)
+                tbx1 = int(min(t["min_x"] for t in line))
+                tby1 = int(min(t["min_y"] for t in line))
+                tbx2 = int(max(t["max_x"] for t in line))
+                tby2 = int(max(t["max_y"] for t in line))
                 structured_elements.append({
                     "type": "Title",
                     "text": header_text,
                     "content": header_text,
                     "confidence": float(np.mean([t["conf"] for t in line])),
-                    "top_y": line_y
+                    "top_y": line_y,
+                    "box": [tbx1, tby1, tbx2, tby2]
                 })
                 continue
 
@@ -892,13 +902,18 @@ class OCREngine:
             m_sec = re.match(r"^(\d+(\.\d+)+)\s+([A-Za-z].*)", norm_line_text)
             if m_sec and len(norm_line_text) < 70:
                 flush_paragraph()
+                hbx1 = int(min(t["min_x"] for t in line))
+                hby1 = int(min(t["min_y"] for t in line))
+                hbx2 = int(max(t["max_x"] for t in line))
+                hby2 = int(max(t["max_y"] for t in line))
                 structured_elements.append({
                     "type": "Heading",
                     "text": norm_line_text,
                     "content": norm_line_text,
                     "confidence": float(np.mean([t["conf"] for t in line])),
                     "top_y": line_y,
-                    "level": 2
+                    "level": 2,
+                    "box": [hbx1, hby1, hbx2, hby2]
                 })
                 continue
 
@@ -944,13 +959,18 @@ class OCREngine:
 
             if is_subheading:
                 flush_paragraph()
+                sbx1 = int(min(t["min_x"] for t in line))
+                sby1 = int(min(t["min_y"] for t in line))
+                sbx2 = int(max(t["max_x"] for t in line))
+                sby2 = int(max(t["max_y"] for t in line))
                 structured_elements.append({
                     "type": "Heading",
                     "text": norm_line_text,
                     "content": norm_line_text,
                     "confidence": avg_line_conf,
                     "top_y": line_y,
-                    "level": 3
+                    "level": 3,
+                    "box": [sbx1, sby1, sbx2, sby2]
                 })
                 continue
 
@@ -1041,7 +1061,9 @@ class OCREngine:
             "html": full_html,
             "validation": val_report,
             "confidence": val_report.get("confidence", {}),
-            "engine": "Offline (PaddleOCR + SLANet)"
+            "engine": "Offline (PaddleOCR + SLANet)",
+            "tokens": tokens,
+            "image_shape": (H, W)
         }
 
     def extract_full_text(self, image: np.ndarray) -> str:

@@ -42,3 +42,8 @@ models/*.pt
 models/*.pth
 models/*.onnx
 !models/.gitkeep
+
+# Generated runtime documents & figures
+documents/figures/
+test_outputs/
+*.pdf
