@@ -35,6 +35,57 @@ class LayoutAnalyzer:
         else:
             print(f"YOLO weights not found at {model_path}. Using high-precision CV layout analyzer.")
 
+    @staticmethod
+    def _merge_overlapping_boxes(boxes: List[Dict[str, Any]], iou_thresh: float = 0.20, contain_thresh: float = 0.50) -> List[Dict[str, Any]]:
+        """
+        Merges overlapping or nested bounding boxes using Intersection over Union (IoU)
+        and containment ratio to prevent duplicate table or text extractions.
+        """
+        if not boxes:
+            return []
+
+        merged = []
+        for b in sorted(boxes, key=lambda x: (x["box"][1], x["box"][0])):
+            bx1, by1, bx2, by2 = b["box"]
+            b_area = max(1, (bx2 - bx1) * (by2 - by1))
+            matched_idx = None
+
+            for idx, m in enumerate(merged):
+                if m.get("type") != b.get("type"):
+                    continue
+                mx1, my1, mx2, my2 = m["box"]
+                m_area = max(1, (mx2 - mx1) * (my2 - my1))
+
+                ix1 = max(bx1, mx1)
+                iy1 = max(by1, my1)
+                ix2 = min(bx2, mx2)
+                iy2 = min(by2, my2)
+
+                if ix1 < ix2 and iy1 < iy2:
+                    inter_area = (ix2 - ix1) * (iy2 - iy1)
+                    union_area = b_area + m_area - inter_area
+                    iou = inter_area / float(union_area)
+                    containment = inter_area / float(min(b_area, m_area))
+
+                    if iou > iou_thresh or containment > contain_thresh:
+                        matched_idx = idx
+                        break
+
+            if matched_idx is not None:
+                mx1, my1, mx2, my2 = merged[matched_idx]["box"]
+                merged[matched_idx]["box"] = [
+                    min(bx1, mx1),
+                    min(by1, my1),
+                    max(bx2, mx2),
+                    max(by2, my2)
+                ]
+                if "confidence" in merged[matched_idx] and "confidence" in b:
+                    merged[matched_idx]["confidence"] = max(merged[matched_idx]["confidence"], b["confidence"])
+            else:
+                merged.append(b.copy())
+
+        return merged
+
     def analyze(self, image: np.ndarray) -> List[Dict[str, Any]]:
         """
         Analyzes the flattened document to find Titles, Headings, Paragraphs, Tables, and Images.
@@ -60,6 +111,7 @@ class LayoutAnalyzer:
                 "confidence": float(box.conf[0])
             })
 
+        layout_boxes = self._merge_overlapping_boxes(layout_boxes, iou_thresh=0.30, contain_thresh=0.60)
         layout_boxes.sort(key=lambda b: (b["box"][1], b["box"][0]))
         return layout_boxes
 
@@ -80,39 +132,105 @@ class LayoutAnalyzer:
         # -------------------------------------------------------------
         # 1. Detect Tables (orthogonal horizontal and vertical grid lines)
         # -------------------------------------------------------------
-        scale_h = max(15, w // 25)
-        scale_v = max(15, h // 30)
-        h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (scale_h, 1))
-        v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, scale_v))
+        # Pre-bridge faint 1-2px breaks in pencil or thin lines
+        closed_thresh = cv2.morphologyEx(
+            thresh, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        )
 
-        h_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, h_kernel)
-        v_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, v_kernel)
+        # Multi-scale line kernels to detect both thin/compact and wide table grids
+        scale_h_fine = max(8, w // 55)
+        scale_v_fine = max(8, h // 55)
+        scale_h_coarse = max(14, w // 30)
+        scale_v_coarse = max(14, h // 30)
+
+        h1 = cv2.morphologyEx(closed_thresh, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (scale_h_fine, 1)))
+        v1 = cv2.morphologyEx(closed_thresh, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, scale_v_fine)))
+        h2 = cv2.morphologyEx(closed_thresh, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (scale_h_coarse, 1)))
+        v2 = cv2.morphologyEx(closed_thresh, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, scale_v_coarse)))
+
+        h_lines = cv2.bitwise_or(h1, h2)
+        v_lines = cv2.bitwise_or(v1, v2)
         table_grid = cv2.add(h_lines, v_lines)
+        intersections = cv2.bitwise_and(h_lines, v_lines)
 
-        table_cnts, _ = cv2.findContours(table_grid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        table_boxes = []
+        # Connect subtle cell junctions and corners
+        grid_connect = cv2.dilate(table_grid, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+
+        table_cnts, _ = cv2.findContours(grid_connect, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        raw_table_boxes = []
         for c in table_cnts:
             bx, by, bw, bh = cv2.boundingRect(c)
             # Table must have notable dimensions
-            if bw > (w * 0.18) and bh > (h * 0.05):
+            if bw > (w * 0.10) and bh > (h * 0.030):
+                # Ignore running header rule lines at the top of the page (aspect ratio > 6.0 touching top margin)
+                if by < 0.08 * h and (bw / float(max(1, bh))) > 5.5:
+                    continue
+
+                # Universal table grid condition:
+                # A genuine table must possess BOTH horizontal and vertical boundary lines
+                # and multiple intersecting cell junctions (corners).
+                # Isolated underlines, horizontal rules, or page borders have near-zero vertical lines and zero intersections.
+                box_h = h_lines[by:by+bh, bx:bx+bw]
+                box_v = v_lines[by:by+bh, bx:bx+bw]
+                box_x = intersections[by:by+bh, bx:bx+bw]
+                h_px = cv2.countNonZero(box_h)
+                v_px = cv2.countNonZero(box_v)
+                x_px = cv2.countNonZero(box_x)
+
+                if v_px < max(80, int(bh * 1.2)) or h_px < max(80, int(bw * 0.4)) or x_px < 8:
+                    continue
+
                 # Tight bounding box to prevent eating preceding text
-                pad_x = 4
+                pad_x = 2
                 pad_y = 2
                 x1 = max(0, bx - pad_x)
                 y1 = max(0, by - pad_y)
                 x2 = min(w, bx + bw + pad_x)
                 y2 = min(h, by + bh + pad_y)
-                table_boxes.append({"type": "Table", "box": [x1, y1, x2, y2]})
+                raw_table_boxes.append({"type": "Table", "box": [x1, y1, x2, y2]})
+
+        # Deduplicate overlapping or nested table boxes
+        table_boxes = self._merge_overlapping_boxes(raw_table_boxes, iou_thresh=0.20, contain_thresh=0.50)
 
         # Sort table boxes top-to-bottom
         table_boxes.sort(key=lambda tb: tb["box"][1])
 
         # -------------------------------------------------------------
-        # 2. Text Segmentation (Clean mask excluding tables)
+        # 1.5 Detect Large Graphic Figures / Diagrams (Non-Table)
+        # -------------------------------------------------------------
+        fig_mask = closed_thresh.copy()
+        for tb in table_boxes:
+            x1, y1, x2, y2 = tb["box"]
+            fig_mask[max(0, y1 - 4):min(h, y2 + 4), max(0, x1 - 4):min(w, x2 + 4)] = 0
+
+        # Detect prominent non-text graphical contours (drawings, photos, charts)
+        fig_cnts, _ = cv2.findContours(fig_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        image_boxes = []
+        for c in fig_cnts:
+            bx, by, bw, bh = cv2.boundingRect(c)
+            # Must have notable dimensions in both axes (not thin individual text lines or standard paragraphs)
+            if bw > (w * 0.25) and bh > (h * 0.18) and (bw * bh) > (w * h * 0.05):
+                # Ignore whole page borders or margins
+                if bw > (w * 0.90) or bh > (h * 0.88):
+                    continue
+                # Reasonable aspect ratio for diagrams and illustrations
+                aspect = bw / float(max(1, bh))
+                if 0.25 <= aspect <= 4.0:
+                    image_boxes.append({
+                        "type": "Image",
+                        "box": [bx, by, bx + bw, by + bh]
+                    })
+        image_boxes = self._merge_overlapping_boxes(image_boxes, iou_thresh=0.25, contain_thresh=0.50)
+
+        # -------------------------------------------------------------
+        # 2. Text Segmentation (Clean mask excluding tables and images)
         # -------------------------------------------------------------
         text_thresh = thresh.copy()
         for tb in table_boxes:
             x1, y1, x2, y2 = tb["box"]
+            text_thresh[max(0, y1 - 4):min(h, y2 + 4), max(0, x1 - 4):min(w, x2 + 4)] = 0
+        for ib in image_boxes:
+            x1, y1, x2, y2 = ib["box"]
             text_thresh[max(0, y1 - 4):min(h, y2 + 4), max(0, x1 - 4):min(w, x2 + 4)] = 0
 
         # Horizontal dilation to connect words in a line
@@ -156,7 +274,7 @@ class LayoutAnalyzer:
                 "box": [px1, py1, px2, py2]
             })
 
-        all_blocks = table_boxes + text_blocks
+        all_blocks = table_boxes + image_boxes + text_blocks
         if not all_blocks:
             return [{"type": "Paragraph", "box": [0, 0, w, h]}]
 

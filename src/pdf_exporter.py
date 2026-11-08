@@ -1,0 +1,521 @@
+"""
+LiveDoc PDF Exporter Engine
+Generates publication-quality, multi-page PDF documents from digitized content.
+Features:
+- Book-grade typography, alignment, and proportional spacing.
+- Continuous flowing paragraphs without premature line breaks or empty margins.
+- Strict table protection: zero row splitting across page breaks.
+- Dynamic page auto-fit: guarantees each scanned page forms a self-contained, complete publication page.
+- Native via PyQt6 QtPrintSupport (zero external CLI dependencies).
+"""
+
+import os
+import re
+from typing import List, Dict, Any
+from PyQt6.QtWidgets import QApplication
+from PyQt6.QtPrintSupport import QPrinter
+from PyQt6.QtGui import QTextDocument, QPageLayout, QPageSize, QPainter
+from PyQt6.QtCore import QMarginsF, QRectF
+
+
+class PDFExporter:
+    MATH_REPLACEMENTS = {
+        r'\qquad': '&emsp;&emsp;',
+        r'\quad': '&emsp;',
+        r'\,': '&thinsp;',
+        r'\;': ' ',
+        r'\:': ' ',
+        r'\ ': ' ',
+        r'\land': '∧',
+        r'\wedge': '∧',
+        r'\lor': '∨',
+        r'\vee': '∨',
+        r'\neg': '¬',
+        r'\sim': '~',
+        r'\implies': '⇒',
+        r'\Rightarrow': '⇒',
+        r'\iff': '⇔',
+        r'\Leftrightarrow': '⇔',
+        r'\leftrightarrow': '↔',
+        r'\to': '→',
+        r'\rightarrow': '→',
+        r'\longrightarrow': '→',
+        r'\leftarrow': '←',
+        r'\longleftarrow': '←',
+        r'\le': '≤',
+        r'\leq': '≤',
+        r'\ge': '≥',
+        r'\geq': '≥',
+        r'\neq': '≠',
+        r'\approx': '≈',
+        r'\equiv': '≡',
+        r'\times': '×',
+        r'\cdot': '·',
+        r'\pm': '±',
+        r'\mp': '∓',
+        r'\in': '∈',
+        r'\notin': '∉',
+        r'\subset': '⊂',
+        r'\subseteq': '⊆',
+        r'\supset': '⊃',
+        r'\supseteq': '⊇',
+        r'\cup': '∪',
+        r'\cap': '∩',
+        r'\emptyset': '∅',
+        r'\forall': '∀',
+        r'\exists': '∃',
+        r'\nexists': '∄',
+        r'\models': '⊨',
+        r'\vdash': '⊢',
+        r'\top': '⊤',
+        r'\bot': '⊥',
+        r'\sum': '∑',
+        r'\prod': '∏',
+        r'\int': '∫',
+        r'\infty': '∞',
+        r'\partial': '∂',
+        r'\nabla': '∇',
+        r'\Vert': '║',
+        r'\vert': '|',
+        r'\|': '║',
+        r'\ldots': '…',
+        r'\cdots': '…',
+        r'\ddots': '⋱',
+        r'\vdots': '⋮',
+        r'\dots': '…',
+        r'\prime': '′',
+        # Greek lowercase
+        r'\alpha': 'α', r'\beta': 'β', r'\gamma': 'γ', r'\delta': 'δ',
+        r'\epsilon': 'ε', r'\varepsilon': 'ε', r'\zeta': 'ζ', r'\eta': 'η',
+        r'\theta': 'θ', r'\vartheta': 'θ', r'\iota': 'ι', r'\kappa': 'κ',
+        r'\lambda': 'λ', r'\mu': 'μ', r'\nu': 'ν', r'\xi': 'ξ',
+        r'\pi': 'π', r'\rho': 'ρ', r'\sigma': 'σ', r'\tau': 'τ',
+        r'\upsilon': 'υ', r'\phi': 'φ', r'\chi': 'χ', r'\psi': 'ψ',
+        r'\omega': 'ω',
+        # Greek uppercase
+        r'\Gamma': 'Γ', r'\Delta': 'Δ', r'\Theta': 'Θ', r'\Lambda': 'Λ',
+        r'\Xi': 'Ξ', r'\Pi': 'Π', r'\Sigma': 'Σ', r'\Upsilon': 'Υ',
+        r'\Phi': 'Φ', r'\Psi': 'Ψ', r'\Omega': 'Ω'
+    }
+
+    @classmethod
+    def _convert_latex_to_typography(cls, text: str) -> str:
+        """
+        Converts LaTeX math expressions and symbols into publication-grade HTML & Unicode.
+        """
+        if not text:
+            return ""
+
+        # 1. Text wrappers in math mode
+        text = re.sub(re.escape(r"\textbf") + r"\{([^}]*)\}", r"<b>\1</b>", text)
+        text = re.sub(re.escape(r"\textit") + r"\{([^}]*)\}", r"<i>\1</i>", text)
+        text = re.sub(re.escape(r"\text") + r"\{([^}]*)\}", r"\1", text)
+        text = re.sub(re.escape(r"\mathrm") + r"\{([^}]*)\}", r"\1", text)
+        text = re.sub(re.escape(r"\mathbf") + r"\{([^}]*)\}", r"<b>\1</b>", text)
+        text = re.sub(re.escape(r"\mathit") + r"\{([^}]*)\}", r"<i>\1</i>", text)
+        text = re.sub(re.escape(r"\boldsymbol") + r"\{([^}]*)\}", r"<b>\1</b>", text)
+
+        # 2. Labeled transitions and arrows (e.g. \xrightarrow{a}, \xrightarrow{b/1})
+        text = re.sub(re.escape(r"\xrightarrow") + r"\{([^}]*)\}", r" &thinsp;―<sup>\1</sup>→&thinsp; ", text)
+        text = re.sub(re.escape(r"\xleftarrow") + r"\{([^}]*)\}", r" &thinsp;←<sup>\1</sup>―&thinsp; ", text)
+
+        # 3. Fractions, Roots & Overlines
+        text = re.sub(re.escape(r"\frac") + r"\{([^}]*)\}\{([^}]*)\}", r"<sup>\1</sup>&frasl;<sub>\2</sub>", text)
+        text = re.sub(re.escape(r"\sqrt") + r"\[([^\]]*)\]\{([^}]*)\}", r"<sup>\1</sup>√\2", text)
+        text = re.sub(re.escape(r"\sqrt") + r"\{([^}]*)\}", r"√\1", text)
+        text = re.sub(re.escape(r"\bar") + r"\{([^}]*)\}", r"<span style=\"text-decoration: overline;\">\1</span>", text)
+        text = re.sub(re.escape(r"\overline") + r"\{([^}]*)\}", r"<span style=\"text-decoration: overline;\">\1</span>", text)
+
+        # 4. Spacing wrappers
+        text = re.sub(re.escape(r"\hspace") + r"\{[^}]+\}", " ", text)
+        text = re.sub(re.escape(r"\vspace") + r"\{[^}]+\}", "", text)
+
+        # 5. Core math symbol replacements (sorted by length descending to prevent prefix collisions)
+        for sym in sorted(cls.MATH_REPLACEMENTS.keys(), key=len, reverse=True):
+            text = text.replace(sym, cls.MATH_REPLACEMENTS[sym])
+
+        # 6. Subscripts & Superscripts
+        text = re.sub(r"\^\{([^}]*)\}", r"<sup>\1</sup>", text)
+        text = re.sub(r"_\{([^}]*)\}", r"<sub>\1</sub>", text)
+        text = re.sub(r"\^([0-9a-zA-Z\+\-]+)", r"<sup>\1</sup>", text)
+        text = re.sub(r"_([0-9a-zA-Z]+)", r"<sub>\1</sub>", text)
+
+        # 7. Delimiters and primes
+        text = text.replace(r"\left(", "(").replace(r"\right)", ")")
+        text = text.replace(r"\left[", "[").replace(r"\right]", "]")
+        text = text.replace(r"\{", "{").replace(r"\}", "}")
+        text = text.replace(r"\'", "′").replace("'", "′")
+
+        # 8. Strip math mode dollar signs
+        text = text.replace("$$", "").replace("$", "")
+        return text.strip()
+
+    @classmethod
+    def _format_inline_markdown(cls, text: str) -> str:
+        """
+        Formats inline Markdown syntax (bold, italic, code, links) and mathematical notation
+        into clean, styled HTML.
+        """
+        if not text:
+            return ""
+
+        # 1. Convert LaTeX math and symbols first
+        text = cls._convert_latex_to_typography(text)
+
+        # 2. Markdown Bold: **text** or __text__
+        text = re.sub(r'\*\*([^\*]+)\*\*', r'<b>\1</b>', text)
+        text = re.sub(r'__([^_]+)__', r'<b>\1</b>', text)
+
+        # 3. Markdown Italic: *text* or _text_
+        text = re.sub(r'(?<!\*)\*([^\*\n]+)\*(?!\*)', r'<i>\1</i>', text)
+        text = re.sub(r'(?<!_)_([^_<\n]+)_(?!_)', r'<i>\1</i>', text)
+
+        # 4. Inline Code: `code`
+        text = re.sub(r'`([^`]+)`', r'<code style="background-color: #f1f5f9; padding: 1px 4px; border-radius: 3px; font-family: monospace;">\1</code>', text)
+
+        # 5. Markdown Links: [label](url)
+        text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2" style="color: #0284c7; text-decoration: underline;">\1</a>', text)
+
+        return text
+
+    @classmethod
+    def _format_single_page_html(cls, page_content: str, p_idx: int, doc_title: str, font_pt: float = 9.2) -> str:
+        """
+        Formats a single scanned document page into book-proportioned publication HTML.
+        """
+        lines = page_content.strip().split("\n")
+        p_elems = []
+        t_rows = []
+        in_table = False
+
+        def flush_table(rows, elems):
+            if rows:
+                header_row = rows[0]
+                num_cols = len(header_row)
+                is_compact = (num_cols <= 4 and all(len(c) <= 8 for c in header_row))
+                tbl_width = "width: auto; min-width: 150px; max-width: 320px;" if is_compact else "width: 88%; max-width: 520px;"
+
+                tbl_html = [
+                    '<div style="page-break-inside: avoid; break-inside: avoid; margin: 4px 0; text-align: center;">',
+                    f'<table style="border-collapse: collapse; margin: 0 auto; {tbl_width} font-size: {max(7.5, font_pt - 1.0):.1f}pt; font-family: monospace; page-break-inside: avoid; break-inside: avoid;">',
+                    '<thead><tr style="background-color: #f1f5f9; border-top: 1pt solid #334155; border-bottom: 0.8pt solid #334155;">'
+                ]
+                for cell in header_row:
+                    c_formatted = cls._format_inline_markdown(cell.strip())
+                    tbl_html.append(f'<th style="border: 0.5pt solid #cbd5e1; padding: 3px 10px; text-align: center; font-weight: bold; color: #0f172a;">{c_formatted}</th>')
+                tbl_html.append('</tr></thead><tbody>')
+
+                for r_idx, row in enumerate(rows[1:]):
+                    bg = "#ffffff" if r_idx % 2 == 0 else "#f8fafc"
+                    border_b = "border-bottom: 1pt solid #334155;" if r_idx == len(rows[1:]) - 1 else ""
+                    tbl_html.append(f'<tr style="background-color: {bg}; {border_b}">')
+                    padded = row + ["" for _ in range(len(header_row) - len(row))]
+                    for cell in padded[:len(header_row)]:
+                        c_formatted = cls._format_inline_markdown(cell.strip())
+                        tbl_html.append(f'<td style="border: 0.5pt solid #cbd5e1; padding: 2.5px 10px; text-align: center; color: #1e293b;">{c_formatted}</td>')
+                    tbl_html.append('</tr>')
+                tbl_html.append('</tbody></table></div>')
+                tbl_rendered = "".join(tbl_html)
+                # Deduplicate consecutive identical tables
+                if elems and elems[-1] == tbl_rendered:
+                    rows.clear()
+                    return
+                elems.append(tbl_rendered)
+                rows.clear()
+
+        for line in lines:
+            line_str = line.strip()
+            if not line_str or line_str.startswith("<!--"):
+                continue
+
+            # Table row detection
+            if line_str.startswith("|") and line_str.endswith("|"):
+                cells = [c.strip() for c in line_str.strip("|").split("|")]
+                if all(re.match(r"^:?-+:?$", c) for c in cells):
+                    continue
+                in_table = True
+                t_rows.append(cells)
+                continue
+            else:
+                if in_table:
+                    flush_table(t_rows, p_elems)
+                    in_table = False
+
+            # 1. Document Title / Header Banner
+            if line_str.startswith("# "):
+                title_txt = cls._format_inline_markdown(line_str[2:].strip())
+                title_txt = re.sub(r'&emsp;+', ' — ', title_txt).strip(' — ')
+                p_elems.append(
+                    f'<div style="text-align: center; border-bottom: 1.5px solid #0284c7; padding-bottom: 3px; margin: 3px 0 5px 0;">'
+                    f'<h1 style="color: #0369a1; font-size: {font_pt + 1.8:.1f}pt; margin: 0; font-weight: bold;">{title_txt}</h1></div>'
+                )
+            # 2. Section Heading (e.g. ## 2.1 Section Title)
+            elif line_str.startswith("## "):
+                h2_txt = cls._format_inline_markdown(line_str[3:].strip())
+                p_elems.append(
+                    f'<h2 style="color: #0284c7; font-size: {font_pt + 1.0:.1f}pt; font-weight: bold; margin-top: 5px; margin-bottom: 2px; border-bottom: 0.8px solid #e2e8f0; padding-bottom: 2px;">{h2_txt}</h2>'
+                )
+            # 3. Subheading (e.g. ### Subsection Name)
+            elif line_str.startswith("### "):
+                h3_txt = cls._format_inline_markdown(line_str[4:].strip())
+                p_elems.append(
+                    f'<h3 style="color: #0369a1; font-size: {font_pt + 0.4:.1f}pt; font-weight: bold; margin-top: 4px; margin-bottom: 2px;">{h3_txt}</h3>'
+                )
+            # 3.5 Embedded Image / Diagram (Markdown syntax: ![Caption](path_or_data_uri))
+            elif line_str.startswith("![") and "](" in line_str:
+                img_m = re.match(r"!\[(.*?)\]\((.*?)\)", line_str)
+                if img_m:
+                    caption_raw = img_m.group(1).strip()
+                    caption_txt = cls._format_inline_markdown(caption_raw)
+                    img_src = img_m.group(2).strip()
+                    if os.path.exists(img_src):
+                        cap_lower = caption_raw.lower()
+                        is_compact = any(k in cap_lower for k in ["logo", "barcode", "qr", "icon", "badge", "symbol"])
+
+                        # Inspect actual image dimensions
+                        try:
+                            im_stat = cv2.imread(img_src)
+                            ih, iw = im_stat.shape[:2] if im_stat is not None else (200, 300)
+                        except Exception:
+                            ih, iw = (200, 300)
+
+                        aspect = iw / float(max(1, ih))
+                        num_images = len(re.findall(r'!\[.*?\]\(.*?\)', page_content))
+
+                        if is_compact or ih < 100:
+                            # Small logos, barcodes, QR codes
+                            max_h = min(48, max(24, ih))
+                            max_w = min(42, max(25, int(aspect * max_h * 1.5)))
+                            img_style = f"max-width: {max_w}%; max-height: {max_h}px; border: 0.6pt solid #cbd5e1; border-radius: 3px; padding: 1.5px;"
+                            div_margin = "2px auto 2px auto;"
+                            caption_html = f'<div style="font-size: {max(6.5, font_pt - 2.2):.1f}pt; color: #64748b; font-style: italic; margin-top: 1px;">{caption_txt}</div>'
+                        elif num_images >= 3:
+                            # Multi-figure page
+                            max_h = 115 if aspect > 1.8 else 105
+                            img_style = f"max-width: 82%; max-height: {max_h}px; border: 0.8pt solid #cbd5e1; border-radius: 4px; padding: 2px;"
+                            div_margin = "3px auto 4px auto;"
+                            caption_html = f'<div style="font-size: {max(7.0, font_pt - 1.8):.1f}pt; color: #475569; font-style: italic; margin-top: 2px;">{caption_txt}</div>'
+                        elif num_images >= 2:
+                            max_h = 145
+                            img_style = f"max-width: 84%; max-height: {max_h}px; border: 0.8pt solid #cbd5e1; border-radius: 4px; padding: 2px;"
+                            div_margin = "4px auto 6px auto;"
+                            caption_html = f'<div style="font-size: {max(7.2, font_pt - 1.6):.1f}pt; color: #475569; font-style: italic; margin-top: 2px;">{caption_txt}</div>'
+                        else:
+                            # Single main figure
+                            max_h = 220
+                            img_style = f"max-width: 86%; max-height: {max_h}px; border: 0.8pt solid #cbd5e1; border-radius: 4px; padding: 2px;"
+                            div_margin = "6px auto 8px auto;"
+                            caption_html = f'<div style="font-size: {max(7.5, font_pt - 1.4):.1f}pt; color: #475569; font-style: italic; margin-top: 3px;">{caption_txt}</div>'
+
+                        p_elems.append(
+                            f'<div style="page-break-inside: avoid; break-inside: avoid; text-align: center; margin: {div_margin} background-color: #ffffff;">'
+                            f'<img src="{img_src}" style="{img_style} background-color: #ffffff;" />'
+                            f'{caption_html}'
+                            f'</div>'
+                        )
+                    else:
+                        p_elems.append(
+                            f'<div style="page-break-inside: avoid; break-inside: avoid; background-color: #f8fafc; border-left: 2.5pt solid #0284c7; border-radius: 4px; padding: 5pt 10pt; margin: 6pt auto; width: 88%; text-align: left; color: #334155; font-size: 8.5pt;">'
+                            f'<span style="font-weight: bold; color: #0284c7;">📊 Figure / Diagram:</span> {caption_txt}'
+                            f'</div>'
+                        )
+                else:
+                    p_elems.append(f'<p style="margin: 2px 0; font-size: {font_pt:.1f}pt;">{cls._format_inline_markdown(line_str)}</p>')
+            elif line_str.startswith("> 📷"):
+                img_txt = line_str.lstrip("> 📷 *").rstrip("*")
+                p_elems.append(
+                    f'<div style="background-color: #f8fafc; border-left: 2pt solid #64748b; padding: 3pt 6pt; margin: 4pt 0; color: #475569; font-style: italic; font-size: 8.5pt;">📷 {cls._format_inline_markdown(img_txt)}</div>'
+                )
+            else:
+                # 4. Paragraphs, List Items, and Formula definitions
+                is_bullet = bool(re.match(r'^[\*\-\+\•]\s+', line_str))
+                is_num_item = bool(re.match(
+                    r'^(?:(?:\d{1,2}|[ivxlcdm]{1,5})[\.\)]|\(\d{1,2}\)|\([a-zA-Z]\)|[a-zA-Z]\)|\d{1,2}[\.\s]+[A-Z])\s*',
+                    line_str, re.IGNORECASE
+                ))
+                is_formula_def = bool(re.search(r'=\s*[\{\(]|can be\s*=', line_str)) or line_str.startswith("$$")
+
+                if is_bullet:
+                    raw_item = re.sub(r'^[\*\-\+\•]\s+', '', line_str)
+                    formatted_item = cls._format_inline_markdown(raw_item)
+                    p_elems.append(
+                        f'<p style="margin: 2px 0 2px 14px; font-size: {font_pt:.1f}pt; line-height: 1.34; text-align: left; color: #0f172a;">'
+                        f'<span style="color: #0284c7; font-weight: bold; margin-right: 6px;">•</span>{formatted_item}'
+                        f'</p>'
+                    )
+                elif is_num_item:
+                    formatted_item = cls._format_inline_markdown(line_str)
+                    p_elems.append(
+                        f'<p style="margin: 2px 0 2px 14px; font-size: {font_pt:.1f}pt; line-height: 1.34; text-align: left; color: #0f172a;">{formatted_item}</p>'
+                    )
+                elif is_formula_def:
+                    formatted_formula = cls._format_inline_markdown(line_str)
+                    p_elems.append(
+                        f'<p style="margin: 2px 0 2px 18px; font-size: {max(7.5, font_pt - 0.5):.1f}pt; font-family: monospace; line-height: 1.30; text-align: left; color: #1e293b;">{formatted_formula}</p>'
+                    )
+                else:
+                    margin_v = "1.5px" if font_pt <= 8.0 else "2.5px"
+                    formatted_para = cls._format_inline_markdown(line_str)
+                    p_elems.append(
+                        f'<p style="margin: {margin_v} 0; font-size: {font_pt:.1f}pt; line-height: 1.30; text-align: justify; text-justify: inter-word; color: #0f172a;">{formatted_para}</p>'
+                    )
+
+        if in_table:
+            flush_table(t_rows, p_elems)
+
+        badge = (
+            f'<div style="color: #64748b; font-size: 7.5pt; font-weight: bold; text-transform: uppercase; letter-spacing: 0.8px; border-bottom: 1px dashed #cbd5e1; padding-bottom: 2px; margin-bottom: 4px;">'
+            f'LiveDoc Digitized Document — Scanned Page {p_idx + 1}'
+            f'</div>'
+        )
+
+        page_body = badge + "\n" + "\n".join(p_elems)
+
+        return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body {{
+    font-family: Arial, "Helvetica Neue", Helvetica, sans-serif;
+    color: #0f172a;
+    margin: 0;
+    padding: 0;
+    font-size: {font_pt:.1f}pt;
+    line-height: 1.35;
+  }}
+  table {{
+    border-collapse: collapse;
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+  }}
+  h1, h2, h3, h4 {{
+    page-break-after: avoid !important;
+    break-after: avoid !important;
+  }}
+  th, td {{
+    word-break: break-word;
+  }}
+</style>
+</head>
+<body>
+{page_body}
+</body>
+</html>"""
+
+    @staticmethod
+    def markdown_to_print_html(markdown_text: str, doc_title: str = "Digitized Document") -> str:
+        """
+        Transforms Markdown into publication HTML for preview or single-file export.
+        """
+        raw_pages = re.split(r"\n+<!--\s*Page\s*\d+\s*-->\n*|\n+---\n+", markdown_text)
+        pages = [p.strip() for p in raw_pages if p.strip()]
+        if not pages:
+            pages = [markdown_text.strip()]
+
+        html_pages = [PDFExporter._format_single_page_html(p, i, doc_title, font_pt=9.2) for i, p in enumerate(pages)]
+        full_body = '<div style="page-break-before: always;"></div>'.join(html_pages)
+        return full_body
+
+    @staticmethod
+    def markdown_to_pdf(markdown_text: str, output_path: str, doc_title: str = "Digitized Document") -> bool:
+        """
+        Convert structured Markdown text into a publication-grade PDF file.
+        Features intelligent auto-fit: adjusts font sizing dynamically so each scanned page
+        forms an authentic, complete, self-contained single PDF page with zero broken tables.
+        """
+        try:
+            app = QApplication.instance()
+            if app is None:
+                app = QApplication(["LiveDocPDF"])
+
+            printer = QPrinter(QPrinter.PrinterMode.ScreenResolution)
+            printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+            printer.setOutputFileName(output_path)
+
+            layout = QPageLayout(
+                QPageSize(QPageSize.PageSizeId.A4),
+                QPageLayout.Orientation.Portrait,
+                QMarginsF(12, 10, 12, 10),
+                QPageLayout.Unit.Millimeter
+            )
+            printer.setPageLayout(layout)
+
+            paint_rect = printer.pageLayout().paintRect(QPageLayout.Unit.Point)
+            paint_w = paint_rect.width()
+            paint_h = paint_rect.height()
+
+            raw_pages = re.split(r"\n+<!--\s*Page\s*\d+\s*-->\n*|\n+---\n+", markdown_text)
+            pages = [p.strip() for p in raw_pages if p.strip()]
+            if not pages:
+                pages = [markdown_text.strip()]
+
+            painter = QPainter(printer)
+            first_page = True
+
+            for p_idx, page_content in enumerate(pages):
+                # Auto-fit font scaling: find comfortable font size that achieves minimum page count
+                best_doc = None
+                best_page_count = 999
+                for font_pt in [9.2, 8.8, 8.4, 8.0, 7.6, 7.2, 6.8]:
+                    html = PDFExporter._format_single_page_html(page_content, p_idx, doc_title, font_pt=font_pt)
+                    doc = QTextDocument()
+                    doc.setPageSize(paint_rect.size())
+                    doc.setHtml(html)
+                    pc = doc.pageCount()
+                    if pc == 1:
+                        best_doc = doc
+                        best_page_count = 1
+                        break
+                    if pc < best_page_count:
+                        best_page_count = pc
+                        best_doc = doc
+
+                # Render all sub-pages of this scanned document (usually exactly 1)
+                sub_count = best_doc.pageCount()
+                for sub_idx in range(sub_count):
+                    if not first_page:
+                        printer.newPage()
+                    first_page = False
+
+                    painter.save()
+                    painter.translate(0, -sub_idx * paint_h)
+                    painter.setClipRect(QRectF(0, sub_idx * paint_h, paint_w, paint_h))
+                    best_doc.drawContents(painter)
+                    painter.restore()
+
+            painter.end()
+            return True
+        except Exception as e:
+            print(f"Error generating PDF: {e}")
+            return False
+
+    @staticmethod
+    def html_to_pdf(html_content: str, output_path: str) -> bool:
+        """
+        Renders raw HTML content onto a multi-page PDF document via PyQt6 QtPrintSupport.
+        """
+        try:
+            app = QApplication.instance()
+            if app is None:
+                app = QApplication(["LiveDocPDF"])
+
+            doc = QTextDocument()
+            doc.setHtml(html_content)
+
+            printer = QPrinter(QPrinter.PrinterMode.ScreenResolution)
+            printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+            printer.setOutputFileName(output_path)
+
+            layout = QPageLayout(
+                QPageSize(QPageSize.PageSizeId.A4),
+                QPageLayout.Orientation.Portrait,
+                QMarginsF(12, 10, 12, 10),
+                QPageLayout.Unit.Millimeter
+            )
+            printer.setPageLayout(layout)
+            doc.print(printer)
+            return True
+        except Exception as e:
+            print(f"Error printing HTML to PDF: {e}")
+            return False

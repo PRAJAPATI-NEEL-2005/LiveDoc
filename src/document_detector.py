@@ -123,7 +123,7 @@ class DocumentDetector:
 
         small_h, small_w = small.shape[:2]
         small_area = small_h * small_w
-        min_doc_area = small_area * 0.15
+        min_doc_area = small_area * 0.45
         max_doc_area = small_area * 0.98
 
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
@@ -155,6 +155,41 @@ class DocumentDetector:
                     approx = cv2.approxPolyDP(c, eps * peri, True)
                     if len(approx) == 4 and cv2.isContourConvex(approx):
                         pts = (approx.reshape(4, 2) / scale).astype(int)
+                        rect = self._order_points(pts)
+                        w = np.linalg.norm(rect[1] - rect[0])
+                        h = np.linalg.norm(rect[3] - rect[0])
+                        aspect = max(w, h) / max(1.0, min(w, h))
+
+                        # Bounding span check: must span at least 55% of camera frame width and height
+                        min_x = np.min(rect[:, 0])
+                        max_x = np.max(rect[:, 0])
+                        min_y = np.min(rect[:, 1])
+                        max_y = np.max(rect[:, 1])
+                        span_w = (max_x - min_x) / float(orig_w)
+                        span_h = (max_y - min_y) / float(orig_h)
+
+                        if 1.05 <= aspect <= 2.2 and span_w >= 0.55 and span_h >= 0.55:
+                            return pts
+
+                # Fallback: if contour represents a document page (> 45% of frame)
+                # but has extra vertices due to thumb/finger or page curvature, use oriented minAreaRect
+                if area >= small_area * 0.45:
+                    rect = cv2.minAreaRect(c)
+                    box = cv2.boxPoints(rect)
+                    pts = (box / scale).astype(int)
+                    ordered = self._order_points(pts)
+                    w = np.linalg.norm(ordered[1] - ordered[0])
+                    h = np.linalg.norm(ordered[3] - ordered[0])
+                    aspect = max(w, h) / max(1.0, min(w, h))
+
+                    min_x = np.min(ordered[:, 0])
+                    max_x = np.max(ordered[:, 0])
+                    min_y = np.min(ordered[:, 1])
+                    max_y = np.max(ordered[:, 1])
+                    span_w = (max_x - min_x) / float(orig_w)
+                    span_h = (max_y - min_y) / float(orig_h)
+
+                    if 1.05 <= aspect <= 2.2 and span_w >= 0.55 and span_h >= 0.55:
                         return pts
 
         return None
@@ -165,9 +200,9 @@ class DocumentDetector:
         rect[0] = pts[np.argmin(s)]
         rect[2] = pts[np.argmax(s)]
 
-        diff = np.diff(pts, axis=1)
-        rect[1] = pts[np.argmin(diff)]
-        rect[3] = pts[np.argmax(diff)]
+        diff = pts[:, 0] - pts[:, 1]
+        rect[1] = pts[np.argmax(diff)]
+        rect[3] = pts[np.argmin(diff)]
         return rect
 
     def flatten_document(self, frame, corners):
@@ -193,12 +228,58 @@ class DocumentDetector:
         warped = cv2.warpPerspective(frame, M, (maxWidth, maxHeight))
         return warped
 
-    def preprocess_for_ocr(self, image):
+    def detect_skew_angle(self, image: np.ndarray) -> float:
         """
-        Gentle contrast normalization to ensure high dynamic range without eroding thin font strokes.
+        Universal document skew angle detection via probabilistic Hough lines.
+        Returns angle in degrees (-20 to +20). If tilt is negligible (< 1.0 deg), returns 0.0.
+        """
+        if image is None or image.size == 0:
+            return 0.0
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        h, w = gray.shape[:2]
+        scale = 960.0 / max(h, w) if max(h, w) > 960 else 1.0
+        if scale < 1.0:
+            small = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        else:
+            small = gray
+        edges = cv2.Canny(small, 50, 150, apertureSize=3)
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 80, minLineLength=80, maxLineGap=10)
+        if lines is not None:
+            angles = []
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+                if -20.0 < angle < 20.0:
+                    angles.append(angle)
+            if len(angles) >= 10:
+                med_angle = float(np.median(angles))
+                if abs(med_angle) >= 1.0:
+                    return med_angle
+        return 0.0
+
+    def deskew_document(self, image: np.ndarray) -> np.ndarray:
+        """
+        Deskews the document image if a tilt >= 1.0 degree is detected.
         """
         if image is None or image.size == 0:
             return image
+        angle = self.detect_skew_angle(image)
+        if abs(angle) >= 1.0:
+            h, w = image.shape[:2]
+            center = (w // 2, h // 2)
+            M = cv2.getRotationMatrix2D(center, angle, 1.0)
+            return cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
+        return image
+
+    def preprocess_for_ocr(self, image):
+        """
+        Gentle contrast normalization and universal deskewing without eroding thin font strokes.
+        """
+        if image is None or image.size == 0:
+            return image
+
+        # 1. Level document if tilted
+        image = self.deskew_document(image)
 
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
         norm = cv2.normalize(gray, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8UC1)

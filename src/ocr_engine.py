@@ -13,10 +13,12 @@ from paddleocr import PaddleOCR
 import numpy as np
 import cv2
 import re
+import os
 from typing import List, Dict, Any
 
 from src.table_extractor import TableExtractor
 from src.validator import DocumentValidator
+from src.layout_analyzer import LayoutAnalyzer
 
 
 class OCREngine:
@@ -27,11 +29,13 @@ class OCREngine:
             use_angle_cls=True,
             lang=lang,
             show_log=False,
-            det_db_box_thresh=0.50,
+            det_limit_side_len=1280,
+            det_db_box_thresh=0.35,
             det_db_unclip_ratio=1.6
         )
         self.table_extractor = TableExtractor()
         self.validator = DocumentValidator(min_confidence_threshold=0.72)
+        self.layout_analyzer = LayoutAnalyzer()
         print("PaddleOCR Initialized successfully!")
 
     @staticmethod
@@ -71,10 +75,46 @@ class OCREngine:
             elif len(raw_ccw) >= len(raw) and not ccw_vert:
                 return raw_ccw, rot_ccw
 
+        # Document tilt / skew compensation:
+        # If wide text lines have a consistent slant angle >= 1.0 deg, deskew and re-run OCR
+        slopes = []
+        for it in raw:
+            pts = np.array(it[0], dtype=np.float32)
+            dx = pts[1, 0] - pts[0, 0]
+            dy = pts[1, 1] - pts[0, 1]
+            if dx > 120:
+                slopes.append(np.degrees(np.arctan2(dy, dx)))
+        if len(slopes) >= 5:
+            med_tilt = float(np.median(slopes))
+            if 1.0 <= abs(med_tilt) <= 25.0:
+                h, w = image.shape[:2]
+                center = (w // 2, h // 2)
+                M = cv2.getRotationMatrix2D(center, med_tilt, 1.0)
+                deskewed_img = cv2.warpAffine(
+                    image, M, (w, h),
+                    flags=cv2.INTER_CUBIC,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=(255, 255, 255)
+                )
+                res_deskewed = self.ocr.ocr(deskewed_img, cls=True)
+                raw_deskewed = res_deskewed[0] if res_deskewed and res_deskewed[0] else []
+                if len(raw_deskewed) >= len(raw):
+                    return raw_deskewed, deskewed_img
+
         return raw, image
 
     @staticmethod
     def _parse_tokens(raw_items):
+        # Compute median text line slope across wide tokens to compensate for slight page slant
+        slopes = []
+        for it in raw_items:
+            pts = np.array(it[0], dtype=np.float32)
+            dx = pts[1, 0] - pts[0, 0]
+            dy = pts[1, 1] - pts[0, 1]
+            if dx > 150:
+                slopes.append(dy / dx)
+        doc_slope = float(np.median(slopes)) if slopes else 0.0
+
         tokens = []
         for it in raw_items:
             pts = np.array(it[0], dtype=np.float32)
@@ -87,6 +127,9 @@ class OCREngine:
             max_x = float(np.max(pts[:, 0]))
             min_y = float(np.min(pts[:, 1]))
             max_y = float(np.max(pts[:, 1]))
+            cx = (min_x + max_x) / 2.0
+            cy = (min_y + max_y) / 2.0
+            y_proj = cy - doc_slope * cx
 
             tokens.append({
                 "text": txt,
@@ -95,12 +138,220 @@ class OCREngine:
                 "max_x": max_x,
                 "min_y": min_y,
                 "max_y": max_y,
-                "cx": (min_x + max_x) / 2.0,
-                "cy": (min_y + max_y) / 2.0,
+                "cx": cx,
+                "cy": cy,
+                "y_proj": y_proj,
                 "h": max(1.0, max_y - min_y),
                 "w": max(1.0, max_x - min_x)
             })
         return tokens
+
+    @staticmethod
+    def _detect_token_grid_boxes(tokens: List[Dict[str, Any]], img_shape, existing_boxes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Dual-layer table recovery: detects structured 2D table grids directly from token alignment,
+        even if camera lighting or faint borders caused CV border morphology to miss the table.
+        Uses proximity clustering on short tabular values while strictly ignoring prose words.
+        """
+        STOPWORDS = {
+            'the', 'this', 'that', 'these', 'those', 'for', 'with', 'from', 'into',
+            'during', 'until', 'against', 'among', 'throughout', 'despite', 'towards',
+            'upon', 'concerning', 'to', 'in', 'of', 'by', 'is', 'are', 'was', 'were',
+            'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'shall',
+            'will', 'should', 'would', 'may', 'might', 'must', 'can', 'could', 'and',
+            'but', 'if', 'or', 'because', 'as', 'while', 'at', 'about', 'between',
+            'through', 'before', 'after', 'above', 'below', 'up', 'down', 'out', 'on',
+            'off', 'over', 'under', 'again', 'further', 'then', 'once', 'such', 'what',
+            'which', 'who', 'whom', 'whose', 'when', 'where', 'why', 'how', 'all', 'any',
+            'both', 'each', 'few', 'more', 'most', 'other', 'some'
+        }
+
+        def is_cell_val(s: str) -> bool:
+            s_clean = s.strip('.,;:()')
+            if not s_clean:
+                return False
+            if s_clean.lower() in ('t', 'f', 'true', 'false', 'yes', 'no'):
+                return True
+            if s_clean.isdigit():
+                return True
+            if len(s_clean) <= 4 and not any(ch.islower() for ch in s_clean):
+                return True
+            if re.match(r'^[A-Za-z0-9\-\^\v\~]+$', s_clean) and len(s_clean) <= 5:
+                return True
+            return False
+
+        H, W = img_shape[:2]
+        med_h = float(np.median([t["h"] for t in tokens if t["h"] > 4])) if tokens else 20.0
+        med_w = float(np.median([t["w"] for t in tokens if t["w"] > 4])) if tokens else 25.0
+
+        cand_tokens = []
+        for t in tokens:
+            txt = t["text"].strip()
+            parts = txt.split()
+            if len(parts) >= 2:
+                if all(is_cell_val(p) for p in parts) and not any(p.lower() in STOPWORDS for p in parts):
+                    cand_tokens.append(t)
+            else:
+                if (is_cell_val(txt) or len(txt) <= 8) and not any(p.lower() in STOPWORDS for p in parts) and t["w"] < 120:
+                    cand_tokens.append(t)
+
+        cand_tokens.sort(key=lambda t: t["cy"])
+
+        # Cluster candidate tabular tokens by vertical proximity and horizontal bounds
+        clusters = []
+        curr_cl = []
+        for t in cand_tokens:
+            if not curr_cl:
+                curr_cl.append(t)
+            else:
+                prev_t = curr_cl[-1]
+                if (t["cy"] - prev_t["cy"]) <= 2.2 * med_h and abs(t["cx"] - prev_t["cx"]) <= 450:
+                    curr_cl.append(t)
+                else:
+                    if len(curr_cl) >= 4:
+                        clusters.append(curr_cl)
+                    curr_cl = [t]
+        if len(curr_cl) >= 4:
+            clusters.append(curr_cl)
+
+        new_boxes = []
+        for cl in clusters:
+            if len(cl) < 6:
+                continue
+            xs = [t["cx"] for t in cl]
+            ys = [t["cy"] for t in cl]
+            bx1 = max(0, int(min(t["min_x"] for t in cl)) - 10)
+            by1 = max(0, int(min(t["min_y"] for t in cl)) - 8)
+            bx2 = min(W, int(max(t["max_x"] for t in cl)) + 10)
+            by2 = min(H, int(max(t["max_y"] for t in cl)) + 8)
+
+            # Check distinct columns: require >= 2 distinct horizontal positions
+            col_clusters = []
+            for x in sorted(xs):
+                matched = None
+                for c in col_clusters:
+                    if abs(x - float(np.mean(c))) < max(25.0, 0.75 * med_w):
+                        matched = c
+                        break
+                if matched is not None:
+                    matched.append(x)
+                else:
+                    col_clusters.append([x])
+
+            if len(col_clusters) < 2:
+                continue
+
+            all_known = existing_boxes + new_boxes
+            overlap = any(
+                not (bx2 < eb["box"][0] or bx1 > eb["box"][2] or by2 < eb["box"][1] or by1 > eb["box"][3])
+                for eb in all_known
+            )
+            if not overlap and (bx2 - bx1) > 80 and (by2 - by1) > 45:
+                new_boxes.append({"type": "Table", "box": [bx1, by1, bx2, by2]})
+
+        return new_boxes
+
+    @staticmethod
+    def _merge_table_boxes(table_boxes: List[Dict[str, Any]], iou_thresh: float = 0.20, contain_thresh: float = 0.45) -> List[Dict[str, Any]]:
+        """
+        Deduplicates table bounding boxes so that overlapping or nested boxes
+        for the same physical table are merged into a single enclosing box.
+        """
+        if not table_boxes:
+            return []
+
+        merged = []
+        for tb in sorted(table_boxes, key=lambda b: (b["box"][1], b["box"][0])):
+            bx1, by1, bx2, by2 = tb["box"]
+            b_area = max(1, (bx2 - bx1) * (by2 - by1))
+            matched_idx = None
+
+            for idx, m in enumerate(merged):
+                mx1, my1, mx2, my2 = m["box"]
+                m_area = max(1, (mx2 - mx1) * (my2 - my1))
+
+                ix1 = max(bx1, mx1)
+                iy1 = max(by1, my1)
+                ix2 = min(bx2, mx2)
+                iy2 = min(by2, my2)
+
+                if ix1 < ix2 and iy1 < iy2:
+                    inter_area = (ix2 - ix1) * (iy2 - iy1)
+                    union_area = b_area + m_area - inter_area
+                    iou = inter_area / float(union_area)
+                    containment = inter_area / float(min(b_area, m_area))
+
+                    if iou > iou_thresh or containment > contain_thresh:
+                        matched_idx = idx
+                        break
+
+            if matched_idx is not None:
+                mx1, my1, mx2, my2 = merged[matched_idx]["box"]
+                merged[matched_idx]["box"] = [
+                    min(bx1, mx1),
+                    min(by1, my1),
+                    max(bx2, mx2),
+                    max(by2, my2)
+                ]
+            else:
+                merged.append(tb.copy())
+
+        return merged
+
+    @staticmethod
+    def _detect_figure_boxes(image: np.ndarray, tokens: List[Dict[str, Any]], table_boxes: List[Dict[str, Any]], assigned_token_indices: set) -> List[Dict[str, Any]]:
+        """
+        Detects prominent visual figures, drawings, charts, or images on the page:
+        - Must have substantial 2D dimensions (w >= 120, h >= 90).
+        - Must have substantial non-text graphical content after removing all detected text tokens.
+        - Text paragraphs and isolated single text lines are strictly never figures.
+        """
+        h, w = image.shape[:2]
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        edges = cv2.Canny(gray, 50, 150)
+
+        # Mask out table regions
+        for tb in table_boxes:
+            bx1, by1, bx2, by2 = tb["box"]
+            edges[max(0, by1 - 5):min(h, by2 + 5), max(0, bx1 - 5):min(w, bx2 + 5)] = 0
+
+        # Mask out all detected text token boxes so text lines are never mistaken for drawings
+        for t in tokens:
+            tx1 = max(0, int(t["min_x"]) - 4)
+            ty1 = max(0, int(t["min_y"]) - 4)
+            tx2 = min(w, int(t["max_x"]) + 4)
+            ty2 = min(h, int(t["max_y"]) + 4)
+            edges[ty1:ty2, tx1:tx2] = 0
+
+        dilated = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)), iterations=2)
+
+        cnts, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        fig_boxes = []
+        for c in cnts:
+            bx, by, bw, bh = cv2.boundingRect(c)
+            # A true figure must have substantial dimensions in both width and height
+            if bw < max(120, int(w * 0.12)) or bh < max(80, int(h * 0.08)):
+                continue
+            if bw > 0.90 * w or bh > 0.88 * h:
+                continue
+            # Suppress small artifacts in the top header or margin zone (staple marks, punch holes, page stamps, watermarks)
+            if by < 0.12 * h and (bw * bh) < (w * h * 0.04):
+                continue
+            aspect = bw / float(max(1, bh))
+            if aspect < 0.20 or aspect > 4.5:
+                continue
+
+            # Must contain significant non-text edge pixels and density
+            crop_edges = edges[by:by+bh, bx:bx+bw]
+            non_text_edge_count = cv2.countNonZero(crop_edges)
+            if non_text_edge_count < max(500, int(bw * bh * 0.02)):
+                continue
+
+            fig_boxes.append({
+                "type": "Image",
+                "box": [bx, by, bx + bw, by + bh]
+            })
+        return fig_boxes
 
     @staticmethod
     def _clean_text_spacing(text: str) -> str:
@@ -108,17 +359,41 @@ class OCREngine:
         General typographic spacing and whitespace normalization for any document:
         - Collapses duplicate spaces.
         - Fixes spacing around punctuation (commas, periods, colons).
-        - Preserves exact characters extracted by OCR without altering content.
+        - Separates outline headings and list item numbers.
+        - Cleans unprintable non-ASCII corruptions while preserving text integrity.
         """
         if not text:
             return ""
         t = text
+        # Remove unprintable/control characters and unicode replacement artifacts
+        t = re.sub(r"[\ufffd\x00-\x08\x0b\x0c\x0e-\x1f]", "", t)
         # Collapse multiple whitespace characters into single space
         t = re.sub(r"[ \t]+", " ", t)
         # Ensure single space after punctuation when followed by a word character
         t = re.sub(r"([,;:?!])([A-Za-z0-9])", r"\1 \2", t)
+        t = re.sub(r"(\.)([A-Za-z])", r"\1 \2", t)
+        # Separate fused words in camelCase or parentheses
+        t = re.sub(r"([a-z]{2,})([A-Z][a-z]{2,})", r"\1 \2", t)
+        t = re.sub(r"([a-zA-Z0-9])\(", r"\1 (", t)
+        t = re.sub(r"\)([a-zA-Z])", r") \1", t)
         # Remove stray space immediately before punctuation
         t = re.sub(r"\s+([,.:;?!])", r"\1", t)
+        # Strip stray leading closing parenthesis/bracket e.g. ') Conjunction' -> 'Conjunction'
+        t = re.sub(r"^\)\s*", "", t)
+        # Separate roman numerals or letters merged with uppercase words e.g. 'vIf and only if' -> 'v) If and only if'
+        def _sep_roman(m):
+            prefix, roman, word = m.group(1), m.group(2), m.group(3)
+            # Preserve mathematical relation variables like iRi, iRj, jRk, jRi
+            if roman in ("i", "j") and word.startswith("R"):
+                return m.group(0)
+            return f"{prefix}{roman}) {word}"
+
+        t = re.sub(r"(^|\s)([ivxlcdm]{1,5})([A-Z][a-z]{1,})", _sep_roman, t)
+        t = re.sub(r"(^|\s)([ivxlcdm]{1,5})\s*([A-Z][a-z]+)", _sep_roman, t)
+        # Separate digits glued directly to capitalized words e.g. '4Symmetric' -> '4. Symmetric'
+        t = re.sub(r"(^|\s)(\d{1,2})([A-Z][a-z]+)", r"\1\2. \3", t)
+        # Space around math equality/operators when between alphanumeric tokens e.g. 'A=B' -> 'A = B'
+        t = re.sub(r"([A-Za-z0-9])(=)([A-Za-z0-9])", r"\1 \2 \3", t)
         return t.strip()
 
     def extract_structured_document(self, image: np.ndarray, layout_boxes: List[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -144,65 +419,203 @@ class OCREngine:
 
         H, W = final_img.shape[:2]
 
-        if not layout_boxes:
-            layout_boxes = []
+        if layout_boxes is None:
+            layout_boxes = self.layout_analyzer.analyze(final_img)
 
         table_boxes = [b for b in layout_boxes if b.get("type") == "Table"]
 
+        # Dual-layer table recovery: detect tables from token grid if CV borders were faint or missed
+        supplemental_boxes = self._detect_token_grid_boxes(tokens, final_img.shape, table_boxes)
+        table_boxes.extend(supplemental_boxes)
+
+        # Merge overlapping table boxes to eliminate duplicate table extractions
+        table_boxes = self._merge_table_boxes(table_boxes, iou_thresh=0.20, contain_thresh=0.45)
+        table_boxes.sort(key=lambda tb: tb["box"][1])
+
         # -----------------------------------------------------------------
-        # STEP 1: Exclusive Table Extraction with Targeted Crop Recovery
+        # STEP 1: Exclusive Table Extraction with Multi-Row Consensus
         # -----------------------------------------------------------------
         assigned_token_indices = set()
         structured_elements = []
+        valid_table_boxes = []
 
         for b_idx, tb in enumerate(table_boxes):
             bx1, by1, bx2, by2 = tb["box"]
             crop = final_img[max(0, by1):min(H, by2), max(0, bx1):min(W, bx2)]
 
-            # Mark tokens in full-page OCR that belong to this table
-            for i, t in enumerate(tokens):
-                if (bx1 - 8 <= t["cx"] <= bx2 + 8) and (by1 <= t["cy"] <= by2 + 4):
-                    assigned_token_indices.add(i)
-
-            # Targeted crop OCR with 1.5x upscale to guarantee 100% cell recovery
-            # (Ensures small single-letter cells like 'T' and 'F' are never skipped by PaddleOCR)
-            ch, cw = crop.shape[:2]
-            scale = 1.5
-            crop_scaled = cv2.resize(crop, (int(cw * scale), int(ch * scale)), interpolation=cv2.INTER_CUBIC)
-            crop_res = self.ocr.ocr(crop_scaled, cls=True)
-            raw_crop_tokens = self._parse_tokens(crop_res[0] if crop_res and crop_res[0] else [])
-
-            # Rescale token coordinates back to original crop geometry
+            # Extract tokens belonging to this table from full-page OCR
             crop_tokens = []
-            for t in raw_crop_tokens:
-                crop_tokens.append({
-                    "text": t["text"],
-                    "conf": t["conf"],
-                    "min_x": t["min_x"] / scale,
-                    "max_x": t["max_x"] / scale,
-                    "min_y": t["min_y"] / scale,
-                    "max_y": t["max_y"] / scale,
-                    "cx": t["cx"] / scale,
-                    "cy": t["cy"] / scale,
-                    "h": t["h"] / scale,
-                    "w": t["w"] / scale,
-                })
+            table_token_indices = []
+            for i, t in enumerate(tokens):
+                if i in assigned_token_indices:
+                    continue
+                if (bx1 - 10 <= t["cx"] <= bx2 + 10) and (by1 - 4 <= t["cy"] <= by2 + 6):
+                    table_token_indices.append(i)
+                    crop_tokens.append({
+                        "text": t["text"],
+                        "conf": t["conf"],
+                        "min_x": t["min_x"] - bx1,
+                        "max_x": t["max_x"] - bx1,
+                        "min_y": t["min_y"] - by1,
+                        "max_y": t["max_y"] - by1,
+                        "cx": t["cx"] - bx1,
+                        "cy": t["cy"] - by1,
+                        "h": t["h"],
+                        "w": t["w"]
+                    })
+
+            # Dual-phase table cell recovery: if full-page OCR has fewer than 8 tokens
+            # or if any cell in candidate table is empty (in headers or rows), run targeted high-res crop OCR
+            need_targeted = (len(crop_tokens) < 8)
+            if not need_targeted and crop_tokens:
+                tbl_check = self.table_extractor.extract_table(crop, crop_tokens)
+                has_empty = (
+                    any(not c.strip() for c in tbl_check.get("headers", [])) or
+                    any(any(not c.strip() for c in r) for r in tbl_check.get("rows", []))
+                )
+                if has_empty:
+                    need_targeted = True
+
+            if need_targeted:
+                ch, cw = crop.shape[:2]
+                scale = 1.5
+                crop_scaled = cv2.resize(crop, (int(cw * scale), int(ch * scale)), interpolation=cv2.INTER_CUBIC)
+                crop_res = self.ocr.ocr(crop_scaled, cls=True)
+                raw_crop_tokens = self._parse_tokens(crop_res[0] if crop_res and crop_res[0] else [])
+
+                if len(raw_crop_tokens) >= len(crop_tokens):
+                    crop_tokens = []
+                    for t in raw_crop_tokens:
+                        crop_tokens.append({
+                            "text": t["text"],
+                            "conf": t["conf"],
+                            "min_x": t["min_x"] / scale,
+                            "max_x": t["max_x"] / scale,
+                            "min_y": t["min_y"] / scale,
+                            "max_y": t["max_y"] / scale,
+                            "cx": t["cx"] / scale,
+                            "cy": t["cy"] / scale,
+                            "h": t["h"] / scale,
+                            "w": t["w"] / scale,
+                        })
 
             if crop_tokens:
                 tbl_data = self.table_extractor.extract_table(crop, crop_tokens)
                 if tbl_data.get("markdown"):
-                    structured_elements.append({
-                        "type": "Table",
-                        "text": tbl_data["markdown"],
-                        "content": tbl_data["markdown"],
-                        "headers": tbl_data["headers"],
-                        "rows": tbl_data["rows"],
-                        "markdown": tbl_data["markdown"],
-                        "html": tbl_data["html"],
-                        "confidence": tbl_data.get("confidence", 1.0),
-                        "box": [bx1, by1, bx2, by2],
-                        "top_y": by1
-                    })
+                    headers = [h for h in tbl_data.get("headers", []) if h.strip()]
+                    rows = tbl_data.get("rows", [])
+                    filled_cells = len(headers) + sum(len([c for c in r if c.strip()]) for r in rows)
+
+                    # Mathematical Table Validation:
+                    # A true table MUST possess >= 2 columns, >= 2 rows (headers + data rows),
+                    # at least 4 filled cells, and >= 4 tokens.
+                    # Prose sentences, fragments, or isolated single words are NEVER tables.
+                    is_valid_table = (
+                        len(headers) >= 2 and
+                        (len(rows) >= 1) and
+                        filled_cells >= 4 and
+                        len(crop_tokens) >= 4
+                    )
+
+                    if is_valid_table:
+                        is_duplicate_table = any(
+                            el.get("type") == "Table" and (
+                                el.get("markdown") == tbl_data["markdown"] or
+                                (el.get("headers") == tbl_data.get("headers") and el.get("rows") == tbl_data.get("rows"))
+                            )
+                            for el in structured_elements
+                        )
+                        if not is_duplicate_table:
+                            valid_table_boxes.append(tb)
+                            assigned_token_indices.update(table_token_indices)
+                            structured_elements.append({
+                                "type": "Table",
+                                "text": tbl_data["markdown"],
+                                "content": tbl_data["markdown"],
+                                "headers": tbl_data["headers"],
+                                "rows": tbl_data["rows"],
+                                "markdown": tbl_data["markdown"],
+                                "html": tbl_data["html"],
+                                "confidence": tbl_data.get("confidence", 1.0),
+                                "box": [bx1, by1, bx2, by2],
+                                "top_y": by1
+                            })
+
+        # Update table_boxes to ONLY genuinely valid tables so rejected fake tables never break prose
+        table_boxes = valid_table_boxes
+
+        # -------------------------------------------------------------
+        # STEP 1.5: Image / Diagram / Figure Extraction
+        # -------------------------------------------------------------
+        cand_img_boxes = [b for b in layout_boxes if b.get("type") in ("Image", "Picture", "Figure")]
+        # Also auto-detect large visual graphics that are not tables
+        supplemental_img_boxes = self._detect_figure_boxes(final_img, tokens, table_boxes, assigned_token_indices)
+        cand_img_boxes.extend(supplemental_img_boxes)
+        cand_img_boxes = self._merge_table_boxes(cand_img_boxes, iou_thresh=0.25, contain_thresh=0.50)
+
+        os.makedirs(os.path.join("documents", "figures"), exist_ok=True)
+        fig_counter = 0
+
+        for ib in cand_img_boxes:
+            bx1, by1, bx2, by2 = ib["box"]
+            # Exclude regions that overlap with validated tables
+            overlaps_table = any(
+                max(bx1, tb["box"][0]) < min(bx2, tb["box"][2]) and
+                max(by1, tb["box"][1]) < min(by2, tb["box"][3])
+                for tb in table_boxes
+            )
+            if overlaps_table:
+                continue
+
+            # Identify tokens inside image box
+            img_token_indices = [
+                i for i, t in enumerate(tokens)
+                if i not in assigned_token_indices and (bx1 - 5 <= t["cx"] <= bx2 + 5) and (by1 - 5 <= t["cy"] <= by2 + 5)
+            ]
+            # If region has a high density of text tokens (> 9), it's a text block, not an image
+            if len(img_token_indices) > 9:
+                continue
+
+            fig_counter += 1
+            cx1 = max(0, bx1)
+            cy1 = max(0, by1)
+            cx2 = min(W, bx2)
+            cy2 = min(H, by2)
+            fig_crop = final_img[cy1:cy2, cx1:cx2]
+
+            fig_filename = f"figure_{fig_counter}.png"
+            fig_rel_path = os.path.join("documents", "figures", fig_filename)
+            fig_abs_path = os.path.abspath(fig_rel_path)
+            cv2.imwrite(fig_abs_path, fig_crop)
+
+            # Look for caption token right below or above the figure
+            caption_text = f"Figure {fig_counter}"
+            for i, t in enumerate(tokens):
+                if i in assigned_token_indices:
+                    continue
+                is_near_y = (by2 <= t["cy"] <= by2 + 40) or (by1 - 40 <= t["cy"] <= by1)
+                is_aligned_x = (bx1 - 30 <= t["cx"] <= bx2 + 30)
+                if is_near_y and is_aligned_x:
+                    txt = t["text"].strip()
+                    if re.search(r"(?i)^(fig|figure|diagram|chart|illustration)\b", txt):
+                        caption_text = txt
+                        assigned_token_indices.add(i)
+                        break
+
+            assigned_token_indices.update(img_token_indices)
+
+            structured_elements.append({
+                "type": "Image",
+                "box": [cx1, cy1, cx2, cy2],
+                "image_path": fig_abs_path,
+                "content": caption_text,
+                "caption": caption_text,
+                "text": f"![{caption_text}]({fig_abs_path})",
+                "markdown": f"![{caption_text}]({fig_abs_path})",
+                "html": f'<div style="text-align: center; margin: 12px 0;"><img src="{fig_abs_path}" style="max-width: 88%; max-height: 280px; border-radius: 4px; border: 1px solid #cbd5e1;" /><div style="font-size: 8pt; color: #64748b; font-style: italic; margin-top: 4px;">{caption_text}</div></div>',
+                "confidence": 1.0,
+                "top_y": cy1
+            })
 
         # -----------------------------------------------------------------
         # STEP 2: Non-Table Text Processing (Exclusively remaining tokens)
@@ -221,12 +634,13 @@ class OCREngine:
                 continue
             clean_free_tokens.append(t)
 
-        clean_free_tokens.sort(key=lambda t: t["cy"])
+        clean_free_tokens.sort(key=lambda t: t.get("y_proj", t["cy"]))
 
         # Cluster into physical lines
         physical_lines = []
         for t in clean_free_tokens:
             matched_line = None
+            t_y = t.get("y_proj", t["cy"])
             for line in physical_lines:
                 # Two tokens that horizontally overlap cannot share the same line
                 has_x_overlap = any(
@@ -236,15 +650,17 @@ class OCREngine:
                 if has_x_overlap:
                     continue
 
-                # Isolated stray token separated by a large horizontal gap (> 90px) from line tokens
+                # Isolated stray token separated by a large horizontal gap from line tokens.
+                # In typography, words on the same line are never separated by more than 75px.
+                # A larger gap indicates a different column, facing page, or margin noise.
                 line_max_x = max(x["max_x"] for x in line)
                 line_min_x = min(x["min_x"] for x in line)
-                if (t["min_x"] - line_max_x > 90 or line_min_x - t["max_x"] > 90) and t["conf"] < 0.85:
+                if (t["min_x"] - line_max_x > 75) or (line_min_x - t["max_x"] > 75):
                     continue
 
-                l_cy = float(np.mean([x["cy"] for x in line]))
+                l_y = float(np.mean([x.get("y_proj", x["cy"]) for x in line]))
                 l_h = float(np.median([x["h"] for x in line]))
-                if abs(t["cy"] - l_cy) < max(0.40 * l_h, 8.0):
+                if abs(t_y - l_y) < max(0.40 * l_h, 8.0):
                     matched_line = line
                     break
             if matched_line is not None:
@@ -257,22 +673,43 @@ class OCREngine:
         for line in physical_lines:
             if len(line) == 1:
                 t = line[0]
+                txt = t["text"].strip()
+                # A wide or multi-word token is a genuine text line, not an optical speck
+                if len(txt) > 15 or t["w"] > 120:
+                    filtered_lines.append(line)
+                    continue
+
                 # High-confidence threshold for single-token lines unless it is a standard list bullet (e.g. '1.', 'A.', 'i)')
-                is_bullet = bool(re.match(r"^(\d+|[ivx]+|[a-z])[\.\)]$", t["text"].strip(), re.IGNORECASE))
+                # Bullets appear in the left margin area (< 70% of page width), never at the far right edge
+                is_bullet = bool(re.match(r"^(\d{1,2}|[ivx]{1,4}|[a-zA-Z])[\.\)]?$", txt)) and (t["min_x"] < 0.70 * W)
                 if not is_bullet:
-                    if t["conf"] < 0.72 or t["min_x"] > 0.88 * W or (t["conf"] < 0.80 and t["w"] < 40):
+                    if t["conf"] < 0.72 or t["min_x"] > 0.82 * W or t["max_x"] < 0.08 * W or (t["conf"] < 0.85 and t["w"] < 50):
                         continue
             filtered_lines.append(line)
         physical_lines = filtered_lines
 
         for line in physical_lines:
             line.sort(key=lambda t: t["min_x"])
-        physical_lines.sort(key=lambda line: float(np.mean([t["cy"] for t in line])))
+        physical_lines.sort(key=lambda line: float(np.mean([t.get("y_proj", t["cy"]) for t in line])))
 
         # -----------------------------------------------------------------
         # STEP 3: Classify Text Lines into Header, Headings, Paragraphs
         # -----------------------------------------------------------------
         med_line_h = float(np.median([t["h"] for t in clean_free_tokens])) if clean_free_tokens else 20.0
+
+        # Calculate typical inter-line spacing (center-to-center distance)
+        line_spacings = []
+        for i in range(1, len(physical_lines)):
+            dy = float(np.mean([t.get("y_proj", t["cy"]) for t in physical_lines[i]])) - float(np.mean([t.get("y_proj", t["cy"]) for t in physical_lines[i-1]]))
+            if 10 <= dy <= 60:
+                line_spacings.append(dy)
+        med_line_spacing = float(np.median(line_spacings)) if line_spacings else (med_line_h * 1.15)
+
+        # Detect typical column margins
+        col_min_x = float(np.percentile([min(t["min_x"] for t in l) for l in physical_lines], 15)) if physical_lines else 0
+        col_max_x = float(np.percentile([max(t["max_x"] for t in l) for l in physical_lines], 85)) if physical_lines else W
+        col_width = max(100.0, col_max_x - col_min_x)
+
         curr_para_lines = []
         curr_para_tokens = []
         curr_para_y = 0
@@ -281,7 +718,96 @@ class OCREngine:
         def flush_paragraph():
             nonlocal curr_para_lines, curr_para_tokens, curr_para_y
             if curr_para_lines:
-                text_block = "\n".join(curr_para_lines).strip()
+                # 1. Expand and split any inline bullets embedded inside lines
+                expanded_lines = []
+                for l in curr_para_lines:
+                    l_str = l.strip()
+                    if not l_str:
+                        continue
+                    # Normalize spacing for bullet punctuation (e.g. '1.Reflexive' -> '1. Reflexive')
+                    t = re.sub(r'(^|\s)([1-9]\d{0,1}|[ivxlcdm]{1,5})([\.\)])([A-Za-z])', r'\1\2\3 \4', l_str)
+                    # Insert missing period after terminal truth values if followed by capital letter
+                    t = re.sub(r"\b(false|true)\s+([A-Z])", r"\1. \2", t)
+                    # Normalize bullets with missing dot/paren only at the START of a line or after punctuation
+                    t = re.sub(r'(^|[;:\-\.\n]\s*)([1-9]\d{0,1})\s*([A-Z][a-z]+)', r'\1\2. \3', t)
+                    t = re.sub(r'(^|[;:\-\.\n]\s*)([ivxlcdm]{1,5})\s*([A-Z][a-z]+)', r'\1\2) \3', t)
+
+                    # Split inline bullets if multiple numbered items were scanned on one line
+                    split_pat = (
+                        r'\s+(?='
+                        r'(?:[1-9]\d{0,1}\.|\([1-9]\d{0,1}\)|[1-9]\d{0,1}\))\s+[A-Z]'
+                        r'|(?:\([ivxlcdm]{1,5}\)|[ivxlcdm]{1,5}\.|\b[ivxlcdm]{1,5}\))\s+[A-Z]'
+                        r'|(?:\([a-zA-Z]\)|[a-zA-Z]\))\s+[A-Z]'
+                        r'|(?:[\u2022\u25cf\u25cb\u25aa\u25ab\u25c6\u2212\-\*])\s+[A-Za-z]'
+                        r'|Every\s+[a-z]+'
+                        r')'
+                    )
+                    parts = re.split(split_pat, t)
+                    expanded_lines.extend(p.strip() for p in parts if p.strip())
+
+                # 2. Assemble lines: join flowing sentences into cohesive paragraphs,
+                # while strictly isolating list items, labeled blocks, and formulas on new lines
+                assembled_lines = []
+                curr_flow = ""
+                for sub_l in expanded_lines:
+                    sub_str = sub_l.strip()
+                    # Discard orphaned standalone digits on their own line (e.g. stray '4' below an already-numbered point)
+                    if re.match(r"^\d{1,2}[\.\)]?$", sub_str) and assembled_lines:
+                        continue
+                    is_bullet = bool(re.match(
+                        r'^(?:'
+                        r'[1-9]\d{0,1}\.|\([1-9]\d{0,1}\)|[1-9]\d{0,1}\)'
+                        r'|\(?[ivxlcdm]{1,5}[\.\)]'
+                        r'|\(?[a-zA-Z]\)'
+                        r'|[\u2022\u25cf\u25cb\u25aa\u25ab\u25c6\u2212\-\*]'
+                        r'|[1-9]\d{0,1}\s+[A-Z][a-z]{2,}'
+                        r'|[ivxlcdm]{1,5}\s+[A-Z][a-z]{2,}'
+                        r')\s+[A-Z]',
+                        sub_l
+                    )) or bool(re.match(r'^[\u2022\u25cf\u25cb\u25aa\u25ab\u25c6\u2212\-\*]\s+[A-Za-z]', sub_l))
+
+                    # Check if previous item was a numbered bullet and current line is a parallel definition item with missing number
+                    prev_last_line = assembled_lines[-1] if assembled_lines else (curr_flow if curr_flow else "")
+                    m_prev_num = re.match(r"^(\d{1,2})\.\s+", prev_last_line)
+                    if m_prev_num and not is_bullet:
+                        prev_num = int(m_prev_num.group(1))
+                        m_if = re.match(r"^[\.\s\-\)]*([A-Z][a-z]{3,}\s+if\b.*)", sub_l)
+                        if m_if:
+                            sub_l = f"{prev_num + 1}. {m_if.group(1)}"
+                            is_bullet = True
+
+                    is_labeled = bool(re.match(
+                        r'^([A-Z][a-zA-Z0-9\s]{1,18}:|(Example|Solution|Definition|Note|Warning|Clause|Step|Terms|Theorem|Lemma|Property|Properties|Rule|Remark|Case)\b)',
+                        sub_l, re.IGNORECASE
+                    ))
+                    is_formula_def = bool(re.search(r'=\s*[\{\(]|can be\s*=', sub_l))
+
+                    is_standalone = is_bullet or is_labeled or is_formula_def
+
+                    prev_ended_intro = bool(curr_flow and (curr_flow.endswith(':') or re.search(r'\bthen\s*$', curr_flow, re.IGNORECASE)))
+                    prev_ended_formula = bool(curr_flow and re.search(r'[\}\)]\s*$', curr_flow))
+
+                    if is_standalone or prev_ended_intro or prev_ended_formula:
+                        if curr_flow:
+                            assembled_lines.append(curr_flow.strip())
+                            curr_flow = ""
+                        if is_bullet or is_formula_def:
+                            assembled_lines.append(sub_l)
+                        else:
+                            curr_flow = sub_l
+                    else:
+                        if not curr_flow:
+                            curr_flow = sub_l
+                        else:
+                            if curr_flow.endswith("-"):
+                                curr_flow = curr_flow[:-1] + sub_l
+                            else:
+                                curr_flow += " " + sub_l
+
+                if curr_flow:
+                    assembled_lines.append(curr_flow.strip())
+
+                text_block = "\n\n".join(assembled_lines).strip()
                 if text_block:
                     avg_c = float(np.mean([t["conf"] for t in curr_para_tokens])) if curr_para_tokens else 1.0
                     structured_elements.append({
@@ -294,19 +820,30 @@ class OCREngine:
                 curr_para_lines = []
                 curr_para_tokens = []
 
-        for line in physical_lines:
-            line_y = float(np.mean([t["cy"] for t in line]))
+        for line_idx, line in enumerate(physical_lines):
+            line_y = float(np.mean([t.get("y_proj", t["cy"]) for t in line]))
             line_h = float(np.median([t["h"] for t in line]))
 
-            # Check if any table is located between previous line and current line
+            # Check if paragraph should be flushed before this line
             if prev_line_y is not None:
+                dy = line_y - prev_line_y
                 table_intervening = any(
                     (prev_line_y <= tb["box"][1] <= line_y) or (tb["box"][1] <= line_y <= tb["box"][3])
                     for tb in table_boxes
                 )
-                if table_intervening:
-                    flush_paragraph()
-                elif line_y - prev_line_y > 2.0 * med_line_h:
+                prev_line = physical_lines[line_idx - 1]
+                prev_line_txt = " ".join(t["text"] for t in prev_line).strip()
+                prev_line_max_x = max(t["max_x"] for t in prev_line)
+                curr_line_min_x = min(t["min_x"] for t in line)
+
+                prev_line_min_x = min(t["min_x"] for t in prev_line)
+                is_para_break = (
+                    table_intervening or
+                    (dy > 1.35 * med_line_spacing) or
+                    (prev_line_max_x < col_min_x + 0.75 * col_width and bool(re.search(r'[.?!:"\']$', prev_line_txt)) and abs(curr_line_min_x - prev_line_min_x) < 50) or
+                    (curr_line_min_x > prev_line_min_x + 35)
+                )
+                if is_para_break:
                     flush_paragraph()
 
             prev_line_y = line_y
@@ -314,16 +851,32 @@ class OCREngine:
             raw_line_text = " ".join(t["text"] for t in line).strip()
             norm_line_text = self._clean_text_spacing(raw_line_text)
 
-            # 1. Page Title / Running Header (Top 14% of page and spans across page)
+            # If line has an intro sentence with an inline outline heading attached e.g. "one by one - i) Negation"
+            m_inline_head = re.match(r"^(.*?(?:one by one|following|below|discuss)[\s\-—:]+)\s*([ivxlcdm]{1,5}\)?\s+[A-Z].*)$", norm_line_text, re.IGNORECASE)
+            if m_inline_head:
+                intro_part = m_inline_head.group(1).strip()
+                head_part = m_inline_head.group(2).strip()
+                if intro_part:
+                    curr_para_lines.append(intro_part)
+                    curr_para_tokens.extend(line)
+                    flush_paragraph()
+                norm_line_text = head_part
+
+            # 1. Page Title / Running Header (Top 22% of page and spans across page or contains section numbering)
             is_running_header = False
-            if line_y < 0.14 * H and len(line) >= 2:
+            if line_y < 0.22 * H and len(line) >= 2:
                 min_x = min(t["min_x"] for t in line)
                 max_x = max(t["max_x"] for t in line)
-                if (max_x - min_x) > 0.40 * W:
+                if (max_x - min_x) > 0.35 * W or re.search(r"\b\d+-\d+\b", norm_line_text):
                     is_running_header = True
 
             if is_running_header:
                 flush_paragraph()
+                # If there were any stray optical artifacts or keyboard noise above the running header, purge them
+                structured_elements = [
+                    el for el in structured_elements
+                    if el.get("top_y", 9999) >= line_y - 15
+                ]
                 header_text = "  •  ".join(t["text"].strip() for t in line)
                 header_text = self._clean_text_spacing(header_text)
                 structured_elements.append({
@@ -354,7 +907,7 @@ class OCREngine:
             avg_line_conf = float(np.mean([t["conf"] for t in line]))
 
             # Headings in printed documents must have reliable OCR confidence
-            if avg_line_conf >= 0.78:
+            if avg_line_conf >= 0.72:
                 # Match Roman numerals ('i)', 'iv)') or letter outlines ('A.', 'B.') with punctuation
                 m_roman = re.match(r"^([ivxlcdm]+)[\.\)\s-]+\s*[A-Za-z]", norm_line_text, re.IGNORECASE)
                 m_letter = re.match(r"^(\([A-Za-z]\)|[A-Za-z][\.\)])\s+[A-Za-z]", norm_line_text)
@@ -365,19 +918,29 @@ class OCREngine:
                     is_formula = bool(re.search(r"[={}<>\[\]~]|\b(in|subset)\b", norm_line_text))
                     if not is_formula:
                         words = norm_line_text.split()
-                        if 1 <= len(words) <= 6 and len(norm_line_text) < 45 and not norm_line_text.endswith("."):
-                            connecting_words = {"is", "are", "was", "were", "of", "to", "in", "on", "at", "for", "with", "by", "and", "or", "the", "a", "an", "then", "if"}
-                            last_raw = words[-1].strip(".,:;()")
-                            # If the last word is purely lowercase and in connecting_words (e.g. "of", "for", "in"), it is a dangling fragment
-                            if not (last_raw.islower() and last_raw in connecting_words):
-                                if len(words) == 1:
-                                    w = words[0].strip(".,:;()")
-                                    if len(w) >= 3 and w.isalpha() and w[0].isupper():
+                        line_w = max(t["max_x"] for t in line) - min(t["min_x"] for t in line)
+                        is_short_line = (1 <= len(words) <= 7 and line_w < 0.52 * col_width and not norm_line_text.endswith("."))
+                        connecting_words = {"is", "are", "was", "were", "of", "to", "in", "on", "at", "for", "with", "by", "and", "or", "the", "a", "an", "then", "if"}
+                        last_raw = words[-1].strip(".,:;()") if words else ""
+                        is_dangling = bool(last_raw.islower() and last_raw in connecting_words)
+
+                        if is_short_line and not is_dangling and words and words[0][0].isupper():
+                            if len(norm_line_text.strip()) < 3:
+                                is_subheading = False
+                            elif len(words) == 1:
+                                w = words[0].strip(".,:;()")
+                                if len(w) >= 3 and w.isalpha() and w[0].isupper():
+                                    prev_y = float(np.mean([t.get("y_proj", t["cy"]) for t in physical_lines[line_idx - 1]])) if line_idx > 0 else None
+                                    has_space_above = (prev_y is None or (line_y - prev_y > 1.25 * med_line_spacing))
+                                    if has_space_above:
                                         is_subheading = True
-                                elif words[0][0].isupper():
-                                    caps = sum(1 for w in words if w.strip(".,:;()")[0:1].isupper() or w.lower() in connecting_words)
-                                    if caps >= len(words) - 1:
-                                        is_subheading = True
+                            else:
+                                caps = sum(1 for w in words if w.strip(".,:;()")[0:1].isupper() or w.lower() in connecting_words)
+                                is_title_cased = (caps >= len(words) - 1)
+                                prev_y = float(np.mean([t.get("y_proj", t["cy"]) for t in physical_lines[line_idx - 1]])) if line_idx > 0 else None
+                                has_space_above = (prev_y is None or (line_y - prev_y > 1.25 * med_line_spacing))
+                                if is_title_cased or has_space_above:
+                                    is_subheading = True
 
             if is_subheading:
                 flush_paragraph()
@@ -442,7 +1005,7 @@ class OCREngine:
             elif el_type == "Table":
                 md_parts.append(el.get("markdown", ""))
             elif el_type == "Image":
-                md_parts.append(f"> 📷 *{content}*")
+                md_parts.append(el.get("markdown") or f"> 📷 *{content}*")
             else:
                 md_parts.append(content)
 
@@ -462,21 +1025,23 @@ class OCREngine:
             elif el_type == "Table":
                 html_parts.append(el.get("html", ""))
             elif el_type == "Image":
-                html_parts.append(f'<div style="background: #1e293b; padding: 10px; border-radius: 6px; color: #94a3b8; font-style: italic;">📷 {content}</div>')
+                html_parts.append(el.get("html") or f'<div style="background: #1e293b; padding: 10px; border-radius: 6px; color: #94a3b8; font-style: italic;">📷 {content}</div>')
             else:
                 formatted_para = content.replace("\n", "<br>")
                 html_parts.append(f'<p style="color: #e2e8f0; line-height: 1.6; margin-bottom: 10px; font-size: 13.5px;">{formatted_para}</p>')
 
         full_html = "\n".join(html_parts)
 
-        val_report = self.validator.generate_report(structured_elements)
+        val_report = self.validator.generate_report(structured_elements, tokens)
 
         return {
             "title": doc_title,
             "elements": structured_elements,
             "markdown": full_markdown,
             "html": full_html,
-            "validation": val_report
+            "validation": val_report,
+            "confidence": val_report.get("confidence", {}),
+            "engine": "Offline (PaddleOCR + SLANet)"
         }
 
     def extract_full_text(self, image: np.ndarray) -> str:
