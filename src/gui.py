@@ -967,18 +967,18 @@ class LiveDocApp(QMainWindow):
 
     def _render_annotated_document(self, flat_img: np.ndarray, elements: list, tokens: list):
         """
-        Renders a crystal-clear 2D annotated visualization of the scanned physical document:
-        - 🟢 Green Bounding Box: Structured Tables
-        - 🟠 Orange Bounding Box: Visual Figures / Diagrams
-        - 🔵 Blue Bounding Box: Document Title & Headings
-        - 🟣 Purple / Slate Box: Text Paragraphs
-        Allows users to visually verify that 100% of physical positions are captured.
+        Renders a 100% clean white digital reconstructed document:
+        - Pure white digital background (zero camera noise, dark shadows, or photo artifacts).
+        - Clean digital typography (Title, Headings, Paragraphs) placed at exact 2D coordinates.
+        - Real digital vector tables with crisp borders and clean cell contents.
+        - Cropped diagram/figure images placed into their detected bounding boxes.
         """
         try:
-            vis = flat_img.copy()
-            H, W = vis.shape[:2]
+            H, W = flat_img.shape[:2] if flat_img is not None else (1200, 800)
+            # 1. Pure clean white digital canvas (NOT the camera photo)
+            canvas = np.ones((H, W, 3), dtype=np.uint8) * 255
 
-            # Draw element boxes
+            # 2. Render digital elements at physical coordinates
             for el in elements:
                 el_type = el.get("type", "Paragraph")
                 box = el.get("box")
@@ -988,33 +988,82 @@ class LiveDocApp(QMainWindow):
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(W - 1, x2), min(H - 1, y2)
 
-                if el_type == "Table":
-                    color = (0, 220, 80)      # Bright Green
-                    label = f"Table ({len(el.get('rows', []))} rows)"
-                elif el_type in ("Image", "Figure", "Picture"):
-                    color = (0, 140, 255)     # Vibrant Orange
-                    label = "Figure / Diagram"
-                elif el_type in ("Title", "Heading"):
-                    color = (255, 180, 0)     # Sky Blue
-                    label = f"{el_type}"
-                else:
-                    color = (200, 100, 180)   # Purple
-                    label = "Paragraph"
+                if el_type == "Title":
+                    t_text = el.get("text") or el.get("content", "")
+                    cv2.putText(canvas, t_text[:55], (x1 + 8, y1 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (140, 50, 10), 2, cv2.LINE_AA)
+                    cv2.line(canvas, (x1, y2), (x2, y2), (200, 120, 20), 2)
 
-                # Draw bounding outline
-                cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-                # Badge header
-                badge_h = 20
-                badge_w = min(150, max(60, len(label) * 9 + 10))
-                cv2.rectangle(vis, (x1, max(0, y1 - badge_h)), (min(W, x1 + badge_w), y1), color, -1)
-                cv2.putText(vis, label, (x1 + 4, max(14, y1 - 5)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+                elif el_type == "Heading":
+                    h_text = el.get("text") or el.get("content", "")
+                    cv2.putText(canvas, h_text[:65], (x1, y1 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.70, (160, 70, 20), 2, cv2.LINE_AA)
+
+                elif el_type == "Table":
+                    # Clean digital table grid
+                    headers = el.get("headers", [])
+                    rows = el.get("rows", [])
+                    num_r = len(rows) + 1
+                    rh = max(22, (y2 - y1) // max(1, num_r))
+                    # Header background fill & border
+                    cv2.rectangle(canvas, (x1, y1), (x2, min(y2, y1 + rh)), (240, 245, 250), -1)
+                    cv2.rectangle(canvas, (x1, y1), (x2, y2), (60, 70, 80), 2)
+                    cv2.line(canvas, (x1, min(y2, y1 + rh)), (x2, min(y2, y1 + rh)), (60, 70, 80), 2)
+                    if headers:
+                        cw = max(30, (x2 - x1) // len(headers))
+                        for ci, ch in enumerate(headers):
+                            cx = x1 + ci * cw
+                            if ci > 0:
+                                cv2.line(canvas, (cx, y1), (cx, y2), (180, 190, 200), 1)
+                            cv2.putText(canvas, str(ch)[:14], (cx + 6, y1 + rh - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (20, 30, 40), 1, cv2.LINE_AA)
+                    for ri, row in enumerate(rows):
+                        ry = y1 + (ri + 1) * rh
+                        if ry < y2:
+                            cv2.line(canvas, (x1, ry), (x2, ry), (210, 220, 230), 1)
+                            if headers:
+                                cw = max(30, (x2 - x1) // len(headers))
+                                for ci, cell in enumerate(row[:len(headers)]):
+                                    cx = x1 + ci * cw
+                                    cv2.putText(canvas, str(cell)[:16], (cx + 6, ry + rh - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (40, 50, 60), 1, cv2.LINE_AA)
+
+                elif el_type in ("Image", "Figure", "Picture"):
+                    fig_path = el.get("image_path")
+                    if fig_path and os.path.exists(fig_path):
+                        fig_crop = cv2.imread(fig_path)
+                        if fig_crop is not None:
+                            fw, fh = x2 - x1, y2 - y1
+                            if fw > 10 and fh > 10:
+                                canvas[y1:y2, x1:x2] = cv2.resize(fig_crop, (fw, fh))
+                    elif flat_img is not None:
+                        crop = flat_img[y1:y2, x1:x2]
+                        if crop.size > 0:
+                            canvas[y1:y2, x1:x2] = crop
+                    cv2.rectangle(canvas, (x1, y1), (x2, y2), (190, 200, 215), 1)
+
+                else:
+                    # Paragraph: wrap lines inside paragraph bounds
+                    p_text = el.get("text") or el.get("content", "")
+                    words = p_text.split()
+                    curr_line = ""
+                    curr_y = y1 + 16
+                    line_h = 18
+                    max_w = x2 - x1
+                    for w in words:
+                        test_line = (curr_line + " " + w).strip()
+                        (tw, _), _ = cv2.getTextSize(test_line, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                        if tw > max_w and curr_line:
+                            if curr_y < y2 - 4:
+                                cv2.putText(canvas, curr_line, (x1, curr_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (25, 30, 40), 1, cv2.LINE_AA)
+                            curr_line = w
+                            curr_y += line_h
+                        else:
+                            curr_line = test_line
+                    if curr_line and curr_y < y2 - 2:
+                        cv2.putText(canvas, curr_line, (x1, curr_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (25, 30, 40), 1, cv2.LINE_AA)
 
             # Resize to fit scroll area comfortably
             target_w = max(550, min(850, self.tab_visual_scroll.width() - 25))
             scale = target_w / float(W)
             target_h = max(100, int(H * scale))
-            resized = cv2.resize(vis, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            resized = cv2.resize(canvas, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
             rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
             qimg = QImage(rgb.data, target_w, target_h, 3 * target_w, QImage.Format.Format_RGB888)
             self.tab_visual_label.setPixmap(QPixmap.fromImage(qimg))

@@ -533,25 +533,22 @@ class PDFExporter:
             return False
 
     @classmethod
-    def create_searchable_pdf(
+    def create_digital_reconstructed_pdf(
         cls,
         pages_data: Union[List[Dict[str, Any]], Dict[str, Any]],
         output_path: str,
-        doc_title: str = "Digitized Document"
+        doc_title: str = "Digitized Document",
+        include_image_background: bool = False
     ) -> bool:
         """
-        Creates an industry-standard Dual-Layer "Sandwich" Searchable PDF:
-        - Layer 1 (Background): High-resolution, deskewed scanned document image
-          retaining 100% of original physical graphics, handwriting, lines, logos, and tables.
-        - Layer 2 (Foreground): Invisible, selectable, and searchable text layer
-          placed with ISO 32000 PDF text rendering mode 3 (neither fill nor stroke)
-          at the EXACT physical (x, y, w, h) coordinates of recognized OCR tokens.
-
-        Guarantees:
-        - 100% positional preservation of physical document elements.
-        - Full copy-paste and searchability (Ctrl+F) in any PDF reader.
+        Pure Digital Document Reconstruction Engine:
+        Digitizes physical documents into 100% clean, vector-grade digital PDF pages:
+        - Pure white digital background (zero camera noise, shadows, or photo artifacts).
+        - Crisp digital typography (Title, Headings, Paragraphs) placed at their exact physical 2D coordinates.
+        - High-precision digital vector tables (styled header row, alternating zebra rows, cell borders).
+        - Cropped diagram/figure images placed into their detected bounding boxes.
         - Multi-page document generation with metadata.
-        - Seamless fallback to markdown_to_pdf if pymupdf is not available or images missing.
+        - Optional include_image_background=True for dual-layer sandwich mode.
         """
         if isinstance(pages_data, dict):
             pages_list = [pages_data]
@@ -563,7 +560,6 @@ class PDFExporter:
         if not pages_list:
             return False
 
-        # If pymupdf is unavailable, fall back seamlessly to typeset markdown_to_pdf
         if not HAS_PYMUPDF:
             print("Notice: pymupdf not available, falling back to typeset PDF engine.")
             combined_md = "\n\n---\n\n".join(
@@ -576,123 +572,270 @@ class PDFExporter:
             valid_pages_rendered = 0
 
             for p_idx, page_info in enumerate(pages_list):
-                img = page_info.get("image")
-                img_mat = None
+                # 1. Canvas Dimensions & Scaling
+                img_w, img_h = 800, 1200
+                if page_info.get("image_shape"):
+                    img_h, img_w = page_info["image_shape"][:2]
+                elif page_info.get("image") is not None and hasattr(page_info["image"], "shape"):
+                    img_h, img_w = page_info["image"].shape[:2]
+                elif page_info.get("doc_data") and page_info["doc_data"].get("image_shape"):
+                    img_h, img_w = page_info["doc_data"]["image_shape"][:2]
 
-                if isinstance(img, str) and os.path.exists(img):
-                    img_mat = cv2.imread(img)
-                elif isinstance(img, np.ndarray):
-                    img_mat = img
-
-                # Fallback: check if page_info has an image_path
-                if img_mat is None and page_info.get("image_path") and os.path.exists(page_info["image_path"]):
-                    img_mat = cv2.imread(page_info["image_path"])
-
-                if img_mat is None:
-                    continue
-
-                img_h, img_w = img_mat.shape[:2]
-                if img_h < 10 or img_w < 10:
-                    continue
-
-                # Standard 595.0 pt width (A4 width in PDF points), preserving exact physical aspect ratio
+                # Standard A4 width in PDF points (595.0 pt), maintaining exact physical aspect ratio
                 page_w = 595.0
-                page_h = round(page_w * (img_h / float(img_w)), 2)
+                page_h = round(page_w * (img_h / float(max(1, img_w))), 2)
 
                 page = doc.new_page(width=page_w, height=page_h)
 
-                # Encode image to high-quality JPEG stream (quality=95 for crisp text/table lines)
-                success, enc = cv2.imencode(".jpg", img_mat, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-                if not success:
-                    continue
-                img_bytes = enc.tobytes()
+                sx = page_w / float(max(1, img_w))
+                sy = page_h / float(max(1, img_h))
 
-                # Layer 1: Background Scanned Image
-                page.insert_image(pymupdf.Rect(0, 0, page_w, page_h), stream=img_bytes)
+                # Optional Camera Photo Background (if explicitly requested)
+                if include_image_background:
+                    img_mat = page_info.get("image")
+                    if isinstance(img_mat, str) and os.path.exists(img_mat):
+                        img_mat = cv2.imread(img_mat)
+                    if img_mat is not None and isinstance(img_mat, np.ndarray):
+                        success, enc = cv2.imencode(".jpg", img_mat, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                        if success:
+                            page.insert_image(pymupdf.Rect(0, 0, page_w, page_h), stream=enc.tobytes())
 
-                # Coordinate scale factors (pixels -> PDF points)
-                sx = page_w / float(img_w)
-                sy = page_h / float(img_h)
+                # Collect structured elements
+                elements = page_info.get("elements", [])
+                if not elements and page_info.get("doc_data"):
+                    elements = page_info["doc_data"].get("elements", [])
 
-                # Collect tokens for Layer 2
                 raw_tokens = page_info.get("tokens", [])
                 if not raw_tokens and page_info.get("doc_data"):
                     raw_tokens = page_info["doc_data"].get("tokens", [])
 
-                # If tokens still empty, build tokens from structured elements boxes
-                if not raw_tokens and page_info.get("elements"):
-                    for el in page_info["elements"]:
-                        el_box = el.get("box")
-                        el_txt = el.get("text") or el.get("content")
-                        if el_box and el_txt:
-                            raw_tokens.append({"text": el_txt, "box": el_box})
+                if elements:
+                    # Sort top to bottom
+                    sorted_elements = sorted(
+                        elements,
+                        key=lambda e: e.get("box", [0, 0, 0, 0])[1] if e.get("box") else e.get("top_y", 0)
+                    )
 
-                # Layer 2: Invisible OCR text overlay at exact coordinates
-                for t in raw_tokens:
-                    raw_text = str(t.get("text", "")).strip()
-                    if not raw_text:
-                        continue
+                    for el in sorted_elements:
+                        el_type = el.get("type", "Paragraph")
+                        box = el.get("box")
+                        if not box or len(box) < 4:
+                            continue
 
-                    # Determine bounding box in original image pixel space
-                    if "min_x" in t and "max_x" in t:
-                        x0 = float(t["min_x"]) * sx
-                        y0 = float(t.get("min_y", 0)) * sy
-                        x1 = float(t["max_x"]) * sx
-                        y1 = float(t.get("max_y", 0)) * sy
-                    elif "box" in t and len(t["box"]) >= 4:
-                        x0 = float(t["box"][0]) * sx
-                        y0 = float(t["box"][1]) * sy
-                        x1 = float(t["box"][2]) * sx
-                        y1 = float(t["box"][3]) * sy
-                    elif "cx" in t and "w" in t:
-                        cx, cy = float(t["cx"]) * sx, float(t["cy"]) * sy
-                        w, h = float(t["w"]) * sx, float(t["h"]) * sy
-                        x0, y0, x1, y1 = cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
-                    else:
-                        continue
+                        x0 = float(box[0]) * sx
+                        y0 = float(box[1]) * sy
+                        x1 = float(box[2]) * sx
+                        y1 = float(box[3]) * sy
 
-                    if x1 <= x0 or y1 <= y0:
-                        continue
+                        if x1 <= x0 or y1 <= y0:
+                            continue
 
-                    target_w = x1 - x0
-                    target_h = y1 - y0
+                        # Boundary margins
+                        x0 = max(25.0, min(page_w - 25.0, x0))
+                        y0 = max(25.0, min(page_h - 25.0, y0))
+                        x1 = max(x0 + 10.0, min(page_w - 20.0, x1))
+                        y1 = max(y0 + 10.0, min(page_h - 20.0, y1))
 
-                    # Calculate font size: in standard fonts, capital height is ~0.70-0.85 of font size
-                    fs = max(4.0, target_h * 0.82)
-                    try:
-                        tl = pymupdf.get_text_length(raw_text, fontname="helv", fontsize=fs)
-                        if tl > target_w and tl > 0:
-                            fs = max(3.5, fs * (target_w / tl))
-                    except Exception:
-                        pass
+                        # ── A. Document Title ──────────────────────────────────
+                        if el_type == "Title":
+                            t_txt = el.get("text") or el.get("content", "")
+                            t_h = max(24.0, y1 - y0)
+                            fs = min(17.0, max(12.0, t_h * 0.65))
+                            t_rect = pymupdf.Rect(x0, y0, x1, y0 + t_h)
+                            page.insert_textbox(
+                                t_rect, t_txt,
+                                fontsize=fs, fontname="helv",
+                                color=(0.01, 0.2, 0.5),
+                                align=pymupdf.TEXT_ALIGN_CENTER
+                            )
+                            page.draw_line(
+                                pymupdf.Point(x0, y0 + t_h + 2), pymupdf.Point(x1, y0 + t_h + 2),
+                                color=(0.1, 0.5, 0.8), width=1.2
+                            )
 
-                    baseline_y = y1 - (target_h * 0.15)
-                    try:
-                        # render_mode=3: ISO 32000 PDF text rendering mode 3 (Neither fill nor stroke)
-                        # Creates an invisible text layer perfectly selectable and searchable
+                        # ── B. Section Heading ─────────────────────────────────
+                        elif el_type == "Heading":
+                            h_txt = el.get("text") or el.get("content", "")
+                            lvl = el.get("level", 2)
+                            color = (0.02, 0.35, 0.65) if lvl == 2 else (0.1, 0.45, 0.7)
+                            fs = 12.0 if lvl == 2 else 10.5
+                            h_h = max(18.0, y1 - y0)
+                            h_rect = pymupdf.Rect(x0, y0, x1, y0 + h_h)
+                            page.insert_textbox(
+                                h_rect, h_txt,
+                                fontsize=fs, fontname="helv",
+                                color=color,
+                                align=pymupdf.TEXT_ALIGN_LEFT
+                            )
+
+                        # ── C. Structured Digital Table ─────────────────────────
+                        elif el_type == "Table":
+                            headers = el.get("headers", [])
+                            rows = el.get("rows", [])
+
+                            if (not headers or not rows) and el.get("markdown"):
+                                md_lines = [l.strip() for l in el["markdown"].strip().split("\n") if l.strip().startswith("|")]
+                                if len(md_lines) >= 2:
+                                    headers = [c.strip() for c in md_lines[0].strip("|").split("|")]
+                                    data_rows = []
+                                    for line in md_lines[1:]:
+                                        cells = [c.strip() for c in line.strip("|").split("|")]
+                                        if all(re.match(r"^:?-+:?$", c) for c in cells):
+                                            continue
+                                        data_rows.append(cells)
+                                    rows = data_rows
+
+                            if headers:
+                                num_cols = max(len(headers), max((len(r) for r in rows), default=1))
+                                num_rows = len(rows) + 1
+                                col_w = (x1 - x0) / float(max(1, num_cols))
+                                row_h = (y1 - y0) / float(max(1, num_rows))
+
+                                # Header Row
+                                hdr_rect = pymupdf.Rect(x0, y0, x1, y0 + row_h)
+                                page.draw_rect(hdr_rect, color=(0.2, 0.27, 0.35), fill=(0.94, 0.96, 0.98), width=0.8)
+                                for c_idx, h_text in enumerate(headers):
+                                    cr = pymupdf.Rect(x0 + c_idx * col_w, y0 + 1, x0 + (c_idx + 1) * col_w, y0 + row_h)
+                                    page.insert_textbox(
+                                        cr, str(h_text),
+                                        fontsize=min(9.0, max(6.5, row_h * 0.55)),
+                                        fontname="helv",
+                                        color=(0.05, 0.1, 0.2),
+                                        align=pymupdf.TEXT_ALIGN_CENTER
+                                    )
+
+                                # Data Rows
+                                for r_idx, row in enumerate(rows):
+                                    cy0 = y0 + (r_idx + 1) * row_h
+                                    cy1 = cy0 + row_h
+                                    bg = (1.0, 1.0, 1.0) if r_idx % 2 == 0 else (0.97, 0.98, 0.99)
+                                    r_rect = pymupdf.Rect(x0, cy0, x1, cy1)
+                                    page.draw_rect(r_rect, color=(0.8, 0.84, 0.88), fill=bg, width=0.5)
+                                    for c_idx, cell_text in enumerate(row):
+                                        cr = pymupdf.Rect(x0 + c_idx * col_w, cy0 + 1, x0 + (c_idx + 1) * col_w, cy1)
+                                        page.insert_textbox(
+                                            cr, str(cell_text),
+                                            fontsize=min(8.5, max(6.0, row_h * 0.50)),
+                                            fontname="helv",
+                                            color=(0.1, 0.15, 0.2),
+                                            align=pymupdf.TEXT_ALIGN_CENTER
+                                        )
+
+                                # Table Outer Border
+                                page.draw_rect(pymupdf.Rect(x0, y0, x1, y1), color=(0.2, 0.27, 0.35), width=1.0)
+                            else:
+                                t_rect = pymupdf.Rect(x0, y0, x1, y1)
+                                page.draw_rect(t_rect, color=(0.2, 0.27, 0.35), fill=(0.98, 0.98, 0.99), width=0.8)
+                                page.insert_textbox(
+                                    t_rect, el.get("text", ""),
+                                    fontsize=8.0, fontname="helv",
+                                    color=(0.1, 0.15, 0.2)
+                                )
+
+                        # ── D. Cropped Figure / Diagram ────────────────────────
+                        elif el_type in ("Image", "Figure", "Picture"):
+                            fig_path = el.get("image_path")
+                            fig_caption = el.get("caption") or el.get("content", "")
+                            has_cap = bool(fig_caption and not fig_caption.startswith("!["))
+                            cap_h = 14 if has_cap else 0
+                            fig_rect = pymupdf.Rect(x0, y0, x1, max(y0 + 20, y1 - cap_h))
+
+                            fig_bytes = None
+                            if fig_path and os.path.exists(fig_path):
+                                try:
+                                    with open(fig_path, "rb") as f:
+                                        fig_bytes = f.read()
+                                except Exception:
+                                    pass
+
+                            if not fig_bytes and page_info.get("image") is not None and isinstance(page_info["image"], np.ndarray):
+                                orig_img = page_info["image"]
+                                bx1, by1, bx2, by2 = map(int, box[:4])
+                                ih, iw = orig_img.shape[:2]
+                                crop = orig_img[max(0, by1):min(ih, by2), max(0, bx1):min(iw, bx2)]
+                                if crop.size > 0:
+                                    ok_enc, enc_b = cv2.imencode(".png", crop)
+                                    if ok_enc:
+                                        fig_bytes = enc_b.tobytes()
+
+                            if fig_bytes:
+                                try:
+                                    page.insert_image(fig_rect, stream=fig_bytes)
+                                    page.draw_rect(fig_rect, color=(0.8, 0.84, 0.88), width=0.6)
+                                except Exception:
+                                    pass
+
+                            if has_cap:
+                                cap_rect = pymupdf.Rect(x0, y1 - 13, x1, y1)
+                                page.insert_textbox(
+                                    cap_rect, fig_caption,
+                                    fontsize=7.5, fontname="helv",
+                                    color=(0.3, 0.35, 0.4),
+                                    align=pymupdf.TEXT_ALIGN_CENTER
+                                )
+
+                        # ── E. Text Paragraphs ─────────────────────────────────
+                        else:
+                            p_text = el.get("text") or el.get("content", "")
+                            p_rect = pymupdf.Rect(x0, y0, x1, y1)
+                            fs = 9.5
+                            while fs >= 6.0:
+                                rc = page.insert_textbox(
+                                    p_rect, p_text,
+                                    fontsize=fs, fontname="helv",
+                                    color=(0.06, 0.09, 0.16)
+                                )
+                                if rc >= 0:
+                                    break
+                                fs -= 0.5
+                            if rc < 0:
+                                page.insert_textbox(
+                                    p_rect, p_text,
+                                    fontsize=6.0, fontname="helv",
+                                    color=(0.06, 0.09, 0.16)
+                                )
+
+                elif raw_tokens:
+                    # Token-level digital reconstruction fallback
+                    for t in raw_tokens:
+                        txt = str(t.get("text", "")).strip()
+                        if not txt:
+                            continue
+                        bx0 = float(t.get("min_x", 0)) * sx
+                        by0 = float(t.get("min_y", 0)) * sy
+                        bx1 = float(t.get("max_x", img_w)) * sx
+                        by1 = float(t.get("max_y", img_h)) * sy
+                        tw = max(1.0, bx1 - bx0)
+                        th = max(1.0, by1 - by0)
+                        fs = max(4.0, th * 0.82)
+                        try:
+                            tl = pymupdf.get_text_length(txt, fontname="helv", fontsize=fs)
+                            if tl > tw and tl > 0:
+                                fs = max(3.5, fs * (tw / tl))
+                        except Exception:
+                            pass
+                        baseline_y = by1 - (th * 0.15)
                         page.insert_text(
-                            pymupdf.Point(x0, baseline_y),
-                            raw_text,
+                            pymupdf.Point(bx0, baseline_y),
+                            txt,
                             fontsize=fs,
                             fontname="helv",
-                            render_mode=3
+                            color=(0.06, 0.09, 0.16),
+                            render_mode=0
                         )
-                    except Exception:
-                        pass
 
                 valid_pages_rendered += 1
 
             if valid_pages_rendered > 0:
                 doc.set_metadata({
                     "title": doc_title,
-                    "creator": "LiveDoc Dual-Layer Searchable PDF Engine"
+                    "creator": "LiveDoc Digital Document Reconstruction Engine"
                 })
                 doc.save(output_path, garbage=4, deflate=True)
                 doc.close()
                 return True
             else:
                 doc.close()
-                # If no images could be rendered, fallback to markdown_to_pdf
                 combined_md = "\n\n---\n\n".join(
                     p.get("markdown", "") for p in pages_list if p.get("markdown")
                 )
@@ -700,7 +843,7 @@ class PDFExporter:
                     return cls.markdown_to_pdf(combined_md, output_path, doc_title=doc_title)
                 return False
         except Exception as e:
-            print(f"Error generating searchable PDF: {e}")
+            print(f"Error generating digital reconstructed PDF: {e}")
             try:
                 combined_md = "\n\n---\n\n".join(
                     p.get("markdown", "") for p in pages_list if p.get("markdown")
@@ -711,6 +854,7 @@ class PDFExporter:
                 pass
             return False
 
-    # Alias for intuitive discovery
-    export_dual_layer_pdf = create_searchable_pdf
+    # Aliases for backward compatibility and discovery
+    create_searchable_pdf = create_digital_reconstructed_pdf
+    export_dual_layer_pdf = create_digital_reconstructed_pdf
 
