@@ -8,18 +8,40 @@ def _get_capture_backend():
 
 
 class LiveCameraManager:
-    def __init__(self, camera_index=0):
-        """Initialize the webcam connection."""
+    def __init__(self, camera_index=None):
+        """Initialize the webcam connection. If camera_index is None, camera is not opened yet."""
         self.camera_index = camera_index
-        backend = _get_capture_backend() if isinstance(camera_index, int) else cv2.CAP_ANY
-        self.cap = cv2.VideoCapture(camera_index, backend)
-        
-        # Check if the camera opened successfully
+        self.cap = None
+        if camera_index is not None:
+            self.open(camera_index)
+        else:
+            self.cap = cv2.VideoCapture()
+
+    def is_opened(self):
+        """Check if the camera is currently connected and open."""
+        return self.cap is not None and self.cap.isOpened()
+
+    def open(self, camera_index=None):
+        """Open a video capture device."""
+        if camera_index is not None:
+            self.camera_index = camera_index
+        if self.camera_index is None:
+            self.camera_index = 0
+
+        self.release()
+        backend = _get_capture_backend() if isinstance(self.camera_index, int) else cv2.CAP_ANY
+        self.cap = cv2.VideoCapture(self.camera_index, backend)
         if not self.cap.isOpened():
-            print(f"Error: Could not open camera {camera_index}.")
-            
+            # Fallback to CAP_ANY if platform-specific backend fails
+            self.cap = cv2.VideoCapture(self.camera_index, cv2.CAP_ANY)
+
+        if not self.cap.isOpened():
+            print(f"Error: Could not open camera {self.camera_index}.")
+            return False
+        return True
+
     @staticmethod
-    def detect_cameras(max_index=10):
+    def detect_cameras(max_index=6):
         """
         Scan camera indices 0 through max_index-1 and return a list of
         available cameras as (index, name) tuples.
@@ -49,30 +71,28 @@ class LiveCameraManager:
 
     def switch_camera(self, camera_index):
         """Release the current camera and open a different one."""
-        self.release()
-        self.camera_index = camera_index
-        backend = _get_capture_backend() if isinstance(camera_index, int) else cv2.CAP_ANY
-        self.cap = cv2.VideoCapture(camera_index, backend)
-        if not self.cap.isOpened():
-            print(f"Error: Could not open camera {camera_index}.")
-            return False
-        return True
+        return self.open(camera_index)
 
     def get_frame(self):
         """Capture and return a single frame from the webcam."""
-        if not self.cap.isOpened():
+        if self.cap is None or not self.cap.isOpened():
             return None
             
         ret, frame = self.cap.read()
-        if ret:
+        if ret and frame is not None:
             return frame
         else:
             return None
             
     def release(self):
         """Release the webcam resource."""
-        if self.cap.isOpened():
-            self.cap.release()
+        if self.cap is not None:
+            try:
+                if self.cap.isOpened():
+                    self.cap.release()
+            except Exception:
+                pass
+            self.cap = cv2.VideoCapture()
 
 
 # --- Quick Test ---

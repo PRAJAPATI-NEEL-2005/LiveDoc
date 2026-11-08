@@ -87,7 +87,7 @@ class LiveDocApp(QMainWindow):
         self.setMinimumSize(1320, 820)
 
         # Backend objects
-        self.camera = LiveCameraManager(0)
+        self.camera = LiveCameraManager(camera_index=None)
         self.available_cameras = []
         self.detector = DocumentDetector()
         self.analyzer = LayoutAnalyzer()
@@ -482,18 +482,17 @@ class LiveDocApp(QMainWindow):
         cam_index = self.available_cameras[combo_index][0]
         cam_label = self.available_cameras[combo_index][1]
 
-        was_running = self.camera_running
-        if was_running:
+        if self.camera_running:
             self.timer.stop()
-
-        success = self.camera.switch_camera(cam_index)
-        if success:
-            self.status_bar.showMessage(f"Switched to {cam_label}")
+            success = self.camera.switch_camera(cam_index)
+            if success:
+                self.timer.start(33)
+                self.status_bar.showMessage(f"Switched to {cam_label}")
+            else:
+                self.status_bar.showMessage(f"Could not open {cam_label}")
         else:
-            self.status_bar.showMessage(f"Could not open {cam_label}")
-
-        if was_running and success:
-            self.timer.start(40)
+            self.camera.camera_index = cam_index
+            self.status_bar.showMessage(f"Selected {cam_label}")
 
     # ── Camera Timer ────────────────────────────────────────
     def _setup_camera_timer(self):
@@ -502,16 +501,31 @@ class LiveDocApp(QMainWindow):
 
     def toggle_camera(self, checked):
         if checked:
+            cam_idx = self.cam_combo.currentData()
+            if cam_idx is None:
+                cam_idx = 0
+
+            self.status_bar.showMessage(f"Connecting to Camera {cam_idx}...")
+            QApplication.processEvents()
+
+            success = self.camera.open(cam_idx)
+            if not success or not self.camera.is_opened():
+                self.btn_camera.setChecked(False)
+                self.btn_camera.setText("  Start Camera")
+                self.status_bar.showMessage(f"Error: Could not open Camera {cam_idx}. Try another camera.")
+                return
+
             self.btn_camera.setText("  Stop Camera")
             self.camera_running = True
             self.btn_scan.setEnabled(True)
-            self.timer.start(40)
+            self.timer.start(33)
             self.status_bar.showMessage("Camera running — position document in frame")
         else:
             self.btn_camera.setText("  Start Camera")
             self.camera_running = False
             self.btn_scan.setEnabled(False)
             self.timer.stop()
+            self.camera.release()
             self.cam_label.clear()
             self.cam_label.setText("Camera Off\n\nClick 'Start Camera' to begin")
             self._set_badge("off")
@@ -523,6 +537,8 @@ class LiveDocApp(QMainWindow):
         self.status_bar.showMessage(f"Camera rotated to {self.rotation_angle}°")
 
     def _update_frame(self):
+        if not self.camera_running:
+            return
         frame = self.camera.get_frame()
         if frame is None:
             return
