@@ -1211,24 +1211,25 @@ class LiveDocApp(QMainWindow):
             combined_md = "\n\n---\n\n".join(self.all_pages_markdown)
             title = self.latest_doc.get("title", "Digitized Document") if self.latest_doc else "Digitized Document"
 
-            # Check if page images and tokens are available for Solution A: Dual-Layer Searchable PDF
-            has_images = any(p.get("image") is not None for p in self.all_pages_data)
-            if has_images:
-                ok = PDFExporter.create_searchable_pdf(self.all_pages_data, path, doc_title=title)
-                if ok:
-                    self.status_bar.showMessage(f"Dual-Layer Searchable PDF successfully saved: {path}")
-                    QMessageBox.information(
-                        self, "PDF Saved",
-                        f"Successfully saved Dual-Layer Searchable PDF to:\n{path}\n\n"
-                        "• 100% exact physical layout, tables & diagrams preserved\n"
-                        "• Selectable, copy-pasteable and searchable text (Ctrl+F)"
-                    )
-                    return
-
-            ok = PDFExporter.markdown_to_pdf(combined_md, path, doc_title=title)
+            # Export as clean digital PDF:
+            # - Pure white background (zero camera image)
+            # - Elements placed at their exact original page positions
+            # - Proper styles: blue titles/headings, styled tables, justified paragraphs
+            ok = PDFExporter.create_digital_reconstructed_pdf(
+                self.all_pages_data, path,
+                doc_title=title,
+                include_image_background=False
+            )
             if ok:
-                self.status_bar.showMessage(f"Document successfully saved as PDF: {path}")
-                QMessageBox.information(self, "PDF Saved", f"Successfully saved PDF to:\n{path}")
+                self.status_bar.showMessage(f"Digital PDF saved: {path}")
+                QMessageBox.information(
+                    self, "PDF Saved",
+                    f"Successfully saved digital PDF to:\n{path}\n\n"
+                    "• Pure white background — zero camera image\n"
+                    "• Elements at exact original document positions\n"
+                    "• Titles in blue, headings styled, tables formatted\n"
+                    "• Searchable and copy-pasteable text"
+                )
             else:
                 QMessageBox.critical(self, "Export Error", "Failed to generate PDF document.")
         except Exception as e:
@@ -1253,11 +1254,12 @@ class LiveDocApp(QMainWindow):
             if "*.pdf" in selected_filter or path.lower().endswith(".pdf"):
                 if not path.lower().endswith(".pdf"):
                     path += ".pdf"
-                has_images = any(p.get("image") is not None for p in self.all_pages_data)
-                if has_images:
-                    ok = PDFExporter.create_searchable_pdf(self.all_pages_data, path, doc_title=title)
-                else:
-                    ok = PDFExporter.markdown_to_pdf(combined_md, path, doc_title=title)
+                # Export clean digital PDF with exact element positions, no camera image
+                ok = PDFExporter.create_digital_reconstructed_pdf(
+                    self.all_pages_data, path,
+                    doc_title=title,
+                    include_image_background=False
+                )
                 if not ok:
                     raise RuntimeError("Failed to generate PDF.")
             elif "*.json" in selected_filter or path.lower().endswith(".json"):

@@ -587,6 +587,12 @@ class PDFExporter:
 
                 page = doc.new_page(width=page_w, height=page_h)
 
+                # Always fill pure white — no camera noise or shadow leakthrough
+                page.draw_rect(
+                    pymupdf.Rect(0, 0, page_w, page_h),
+                    color=None, fill=(1.0, 1.0, 1.0)
+                )
+
                 sx = page_w / float(max(1, img_w))
                 sy = page_h / float(max(1, img_h))
 
@@ -616,25 +622,54 @@ class PDFExporter:
                         key=lambda e: e.get("box", [0, 0, 0, 0])[1] if e.get("box") else e.get("top_y", 0)
                     )
 
+                    _L = 28.0                   # left margin (pt)
+                    _R = page_w - 22.0          # right margin (pt)
+                    _flow_y = 28.0              # flowing cursor for elements without box
+
                     for el in sorted_elements:
                         el_type = el.get("type", "Paragraph")
                         box = el.get("box")
-                        if not box or len(box) < 4:
+
+                        if box and len(box) >= 4 and box[2] > box[0] and box[3] > box[1]:
+                            # ── Offline OCR mode: exact coordinates from image ──
+                            x0 = float(box[0]) * sx
+                            y0 = float(box[1]) * sy
+                            x1 = float(box[2]) * sx
+                            y1 = float(box[3]) * sy
+
+                            # Clamp to safe page margins
+                            x0 = max(_L, min(page_w - 22.0, x0))
+                            y0 = max(5.0, min(page_h - 15.0, y0))
+                            x1 = max(x0 + 15.0, min(page_w - 18.0, x1))
+                            y1 = max(y0 + 10.0, min(page_h - 10.0, y1))
+                            _flow_y = max(_flow_y, y1 + 3.0)
+
+                        else:
+                            # ── Smart AI / no-box mode: flowing layout ──
+                            x0, x1 = _L, _R
+                            if el_type == "Title":
+                                el_h = 26.0
+                            elif el_type == "Heading":
+                                el_h = 20.0 if el.get("level", 2) == 2 else 16.0
+                            elif el_type == "Table":
+                                el_h = max(50.0, (len(el.get("rows", [])) + 1) * 16.0)
+                            elif el_type in ("Image", "Figure", "Picture"):
+                                el_h = 100.0
+                            else:
+                                txt = el.get("text") or el.get("content", "")
+                                cpl = max(1, int((_R - _L) / 5.2))
+                                el_h = min(
+                                    page_h - _flow_y - 18.0,
+                                    max(14.0, (len(txt) // cpl + 1) * 11.5)
+                                )
+
+                            if _flow_y + el_h > page_h - 12.0:
+                                continue   # page full — skip overflow
+                            y0, y1 = _flow_y, _flow_y + el_h
+                            _flow_y = y1 + 5.0
+
+                        if x1 <= x0 + 2.0 or y1 <= y0 + 2.0:
                             continue
-
-                        x0 = float(box[0]) * sx
-                        y0 = float(box[1]) * sy
-                        x1 = float(box[2]) * sx
-                        y1 = float(box[3]) * sy
-
-                        if x1 <= x0 or y1 <= y0:
-                            continue
-
-                        # Boundary margins
-                        x0 = max(25.0, min(page_w - 25.0, x0))
-                        y0 = max(25.0, min(page_h - 25.0, y0))
-                        x1 = max(x0 + 10.0, min(page_w - 20.0, x1))
-                        y1 = max(y0 + 10.0, min(page_h - 20.0, y1))
 
                         # ── A. Document Title ──────────────────────────────────
                         if el_type == "Title":
