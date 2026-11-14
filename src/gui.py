@@ -40,6 +40,7 @@ from src.layout_analyzer import LayoutAnalyzer
 from src.ocr_engine import OCREngine
 from src.smart_ai_engine import SmartAIEngine
 from src.pdf_exporter import PDFExporter
+from src.layout_renderer import render_page_pixmap, export_pdf as export_layout_pdf
 
 
 # ─────────────────────────────────────────────────────────
@@ -418,6 +419,14 @@ class LiveDocApp(QMainWindow):
             QPushButton#btn_export:hover {
                 background-color: #0369a1;
             }
+            QPushButton#btn_upload {
+                background-color: #7c3aed;
+                color: #ffffff;
+                font-weight: bold;
+            }
+            QPushButton#btn_upload:hover {
+                background-color: #6d28d9;
+            }
             QPushButton#btn_pdf {
                 background-color: #dc2626;
                 color: #ffffff;
@@ -678,6 +687,12 @@ class LiveDocApp(QMainWindow):
         self.btn_rotate.setObjectName("btn_secondary")
         self.btn_rotate.clicked.connect(self._rotate_view)
 
+        self.btn_upload = QPushButton("  📂 Upload Image")
+        self.btn_upload.setObjectName("btn_upload")
+        self.btn_upload.setMinimumWidth(150)
+        self.btn_upload.setToolTip("Upload an image file (JPG, PNG, TIFF, BMP) and digitize it")
+        self.btn_upload.clicked.connect(self._upload_image)
+
         # Scan Mode selection
         mode_label = QLabel("Mode:")
         mode_label.setStyleSheet("color: #38bdf8; font-weight: bold;")
@@ -718,6 +733,7 @@ class LiveDocApp(QMainWindow):
         ctrl_layout.addSpacing(4)
         ctrl_layout.addWidget(self.btn_camera)
         ctrl_layout.addWidget(self.btn_rotate)
+        ctrl_layout.addWidget(self.btn_upload)
         ctrl_layout.addSpacing(8)
         ctrl_layout.addWidget(mode_label)
         ctrl_layout.addWidget(self.mode_combo)
@@ -965,116 +981,74 @@ class LiveDocApp(QMainWindow):
         self.scan_worker.status_update.connect(self.status_bar.showMessage)
         self.scan_worker.start()
 
-    def _render_annotated_document(self, flat_img: np.ndarray, elements: list, tokens: list):
+    def _render_annotated_document(self, flat_img, elements: list, tokens: list, doc_data: dict = None):
         """
-        Renders the actual scanned document image with coloured element overlays:
-        - Real document photo as background (brightened for clarity)
-        - Semi-transparent coloured region per element type
-        - Solid border + label badge showing Title / Heading / Paragraph / Table / Image
-        - Table grid drawn inside detected table regions
+        Visual 2D Layout: clean digital reconstruction of the page.
+        White background, every text line / table / figure drawn at the position
+        it had on the physical page. Uses the same renderer as the PDF export.
         """
         try:
-            if flat_img is None or flat_img.size == 0:
-                return
-            H, W = flat_img.shape[:2]
-
-            # Base: actual document image, slightly brightened so overlays pop
-            canvas = cv2.convertScaleAbs(flat_img, alpha=0.80, beta=50)
-
-            # Colour scheme per element type  (BGR)
-            TYPE_STYLE = {
-                "Title":     {"box": (30,  100, 220), "fill": (200, 220, 255), "label": "TITLE"},
-                "Heading":   {"box": (20,  160,  60), "fill": (200, 255, 210), "label": "HEADING"},
-                "Paragraph": {"box": (160,  60,  20), "fill": (220, 200, 255), "label": "PARA"},
-                "Table":     {"box": (40,  160, 200), "fill": (220, 250, 255), "label": "TABLE"},
-                "Image":     {"box": (40,  200, 100), "fill": (220, 255, 220), "label": "IMAGE"},
+            page = {
+                "elements": elements,
+                "image_shape": (doc_data or {}).get("image_shape") or (flat_img.shape[:2] if flat_img is not None else None),
             }
-
-            for el in elements:
-                box = el.get("box")
-                if not box or len(box) < 4:
-                    continue
-                x1, y1, x2, y2 = map(int, box[:4])
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(W - 1, x2), min(H - 1, y2)
-                if x2 <= x1 + 2 or y2 <= y1 + 2:
-                    continue
-
-                el_type = el.get("type", "Paragraph")
-                style   = TYPE_STYLE.get(el_type, TYPE_STYLE["Paragraph"])
-                bcol    = style["box"]
-                fcol    = style["fill"]
-                label   = style["label"]
-
-                # Semi-transparent fill
-                overlay = canvas.copy()
-                cv2.rectangle(overlay, (x1, y1), (x2, y2), fcol, -1)
-                cv2.addWeighted(overlay, 0.22, canvas, 0.78, 0, canvas)
-
-                # Solid border
-                thick = 2 if el_type in ("Title", "Table") else 1
-                cv2.rectangle(canvas, (x1, y1), (x2, y2), bcol, thick)
-
-                # Label badge (small filled rect + white text)
-                badge_w = len(label) * 7 + 8
-                bx2 = min(W - 1, x1 + badge_w)
-                by2 = min(H - 1, y1 + 15)
-                cv2.rectangle(canvas, (x1, y1), (bx2, by2), bcol, -1)
-                cv2.putText(canvas, label, (x1 + 3, y1 + 11),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.36, (255, 255, 255), 1, cv2.LINE_AA)
-
-                # Table grid inside the detected region
-                if el_type == "Table":
-                    headers = el.get("headers", [])
-                    rows    = el.get("rows", [])
-                    num_r   = len(rows) + 1
-                    rh = max(16, (y2 - y1) // max(1, num_r))
-                    hdr_y2  = min(y2, y1 + rh)
-                    cv2.rectangle(canvas, (x1, y1), (x2, hdr_y2), (200, 215, 230), -1)
-                    cv2.rectangle(canvas, (x1, y1), (x2, y2), bcol, 1)
-                    cv2.line(canvas, (x1, hdr_y2), (x2, hdr_y2), bcol, 1)
-                    if headers:
-                        ncols = max(1, len(headers))
-                        cw = (x2 - x1) // ncols
-                        for ci, hdr in enumerate(headers):
-                            cx = x1 + ci * cw
-                            if ci > 0:
-                                cv2.line(canvas, (cx, y1), (cx, y2), bcol, 1)
-                            cv2.putText(canvas, str(hdr)[:14], (cx + 4, y1 + rh - 4),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.36, (10, 30, 60), 1, cv2.LINE_AA)
-                    for ri in range(len(rows)):
-                        ry = y1 + (ri + 1) * rh
-                        if ry >= y2:
-                            break
-                        cv2.line(canvas, (x1, ry), (x2, ry), (160, 180, 200), 1)
-
-                elif el_type in ("Image", "Figure", "Picture"):
-                    # Place actual figure crop if saved
-                    fig_path = el.get("image_path")
-                    if fig_path and os.path.exists(fig_path):
-                        fig_crop = cv2.imread(fig_path)
-                        if fig_crop is not None and (x2-x1) > 10 and (y2-y1) > 10:
-                            canvas[y1:y2, x1:x2] = cv2.resize(fig_crop, (x2-x1, y2-y1))
-
-            # Legend (top-right corner)
-            leg_x, leg_y = W - 115, 8
-            for etype, st in TYPE_STYLE.items():
-                cv2.rectangle(canvas, (leg_x, leg_y), (leg_x + 12, leg_y + 12), st["box"], -1)
-                cv2.putText(canvas, etype, (leg_x + 16, leg_y + 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.33, st["box"], 1, cv2.LINE_AA)
-                leg_y += 18
-
-            # Resize to fit scroll area
-            target_w = max(550, min(850, self.tab_visual_scroll.width() - 25))
-            scale    = target_w / float(W)
-            target_h = max(100, int(H * scale))
-            resized  = cv2.resize(canvas, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-            rgb      = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-            qimg     = QImage(rgb.data, target_w, target_h, 3 * target_w, QImage.Format.Format_RGB888)
-            self.tab_visual_label.setPixmap(QPixmap.fromImage(qimg))
+            target_w = max(550, min(900, self.tab_visual_scroll.width() - 25))
+            pix = render_page_pixmap(page, target_w)
+            self.tab_visual_label.setPixmap(pix)
             self.tab_visual_label.setText("")
         except Exception as e:
             print(f"Error rendering visual document: {e}")
+
+    # ── Image Upload ──────────────────────────────────────
+    def _upload_image(self):
+        """Open a file dialog, load the image, preview it, and auto-digitize."""
+        file_filter = (
+            "Image Files (*.jpg *.jpeg *.png *.bmp *.tiff *.tif *.webp *.jfif);;"
+            "All Files (*)"
+        )
+        img_path, _ = QFileDialog.getOpenFileName(
+            self, "Upload Image to Digitize", "", file_filter
+        )
+        if not img_path:
+            return  # User cancelled
+
+        # Read with OpenCV (handles all common image formats)
+        frame = cv2.imread(img_path)
+        if frame is None:
+            QMessageBox.critical(
+                self, "Image Load Error",
+                f"Could not read the image file:\n{img_path}\n\n"
+                "Please make sure it is a valid image (JPG, PNG, BMP, TIFF, etc.)."
+            )
+            return
+
+        # Store frame so scan_document() picks it up
+        self.current_frame = frame.copy()
+        self._uploaded_image_path = img_path
+
+        # Show thumbnail preview in the camera feed label
+        lbl_w = max(self.cam_label.width(), 320)
+        lbl_h = max(self.cam_label.height(), 240)
+        fh, fw = frame.shape[:2]
+        scale = min(lbl_w / float(fw), lbl_h / float(fh))
+        nw, nh = max(1, int(fw * scale)), max(1, int(fh * scale))
+        thumb = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        import os as _os
+        fname = _os.path.basename(img_path)
+        # Draw a small label on the preview so the user knows which file is loaded
+        cv2.putText(thumb, f"Uploaded: {fname}", (10, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 220, 100), 2, cv2.LINE_AA)
+        rgb = cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB)
+        qimg = QImage(rgb.data, nw, nh, 3 * nw, QImage.Format.Format_RGB888)
+        self.cam_label.setPixmap(QPixmap.fromImage(qimg))
+        self.cam_label.setText("")
+
+        # Enable Scan button (works even when camera is off) and auto-digitize
+        self.btn_scan.setEnabled(True)
+        self.status_bar.showMessage(
+            f"Image loaded: {img_path}  —  digitizing now..."
+        )
+        self.scan_document()
 
     def _on_scan_result(self, doc_data, flat_img):
         self.progress.setVisible(False)
@@ -1115,7 +1089,7 @@ class LiveDocApp(QMainWindow):
 
         # 0. Update Visual 2D Document Layout Tab
         if flat_img is not None:
-            self._render_annotated_document(flat_img, elements, doc_data.get("tokens", []))
+            self._render_annotated_document(flat_img, elements, doc_data.get("tokens", []), doc_data)
 
         # 1. Update Formatted Document Tab
         combined_html = "".join(self.all_pages_html)
@@ -1219,7 +1193,7 @@ class LiveDocApp(QMainWindow):
             # Export as clean structured digital PDF:
             # Properly typeset flowing document - headings bold & coloured,
             # tables formatted, paragraphs justified, no camera image anywhere
-            ok = PDFExporter.markdown_to_pdf(combined_md, path, doc_title=title)
+            ok = export_layout_pdf(self.all_pages_data, path, title=title)
             if ok:
                 self.status_bar.showMessage(f"Digital PDF saved: {path}")
                 QMessageBox.information(
@@ -1256,7 +1230,7 @@ class LiveDocApp(QMainWindow):
                 if not path.lower().endswith(".pdf"):
                     path += ".pdf"
                 # Clean structured typeset PDF - no camera image
-                ok = PDFExporter.markdown_to_pdf(combined_md, path, doc_title=title)
+                ok = export_layout_pdf(self.all_pages_data, path, title=title)
                 if not ok:
                     raise RuntimeError("Failed to generate PDF.")
             elif "*.json" in selected_filter or path.lower().endswith(".json"):

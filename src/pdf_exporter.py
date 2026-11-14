@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import QApplication
 from PyQt6.QtPrintSupport import QPrinter
 from PyQt6.QtGui import QTextDocument, QPageLayout, QPageSize, QPainter
 from PyQt6.QtCore import QMarginsF, QRectF
+from src.text_markup import clean_display_text
 
 
 class PDFExporter:
@@ -673,7 +674,7 @@ class PDFExporter:
 
                         # ── A. Document Title ──────────────────────────────────
                         if el_type == "Title":
-                            t_txt = el.get("text") or el.get("content", "")
+                            t_txt = clean_display_text(el.get("text") or el.get("content", ""))
                             t_h = max(24.0, y1 - y0)
                             fs = min(17.0, max(12.0, t_h * 0.65))
                             t_rect = pymupdf.Rect(x0, y0, x1, y0 + t_h)
@@ -690,7 +691,7 @@ class PDFExporter:
 
                         # ── B. Section Heading ─────────────────────────────────
                         elif el_type == "Heading":
-                            h_txt = el.get("text") or el.get("content", "")
+                            h_txt = clean_display_text(el.get("text") or el.get("content", ""))
                             lvl = el.get("level", 2)
                             color = (0.02, 0.35, 0.65) if lvl == 2 else (0.1, 0.45, 0.7)
                             fs = 12.0 if lvl == 2 else 10.5
@@ -732,7 +733,7 @@ class PDFExporter:
                                 for c_idx, h_text in enumerate(headers):
                                     cr = pymupdf.Rect(x0 + c_idx * col_w, y0 + 1, x0 + (c_idx + 1) * col_w, y0 + row_h)
                                     page.insert_textbox(
-                                        cr, str(h_text),
+                                        cr, clean_display_text(str(h_text)),
                                         fontsize=min(9.0, max(6.5, row_h * 0.55)),
                                         fontname="helv",
                                         color=(0.05, 0.1, 0.2),
@@ -749,7 +750,7 @@ class PDFExporter:
                                     for c_idx, cell_text in enumerate(row):
                                         cr = pymupdf.Rect(x0 + c_idx * col_w, cy0 + 1, x0 + (c_idx + 1) * col_w, cy1)
                                         page.insert_textbox(
-                                            cr, str(cell_text),
+                                            cr, clean_display_text(str(cell_text)),
                                             fontsize=min(8.5, max(6.0, row_h * 0.50)),
                                             fontname="helv",
                                             color=(0.1, 0.15, 0.2),
@@ -795,7 +796,7 @@ class PDFExporter:
 
                             if fig_bytes:
                                 try:
-                                    page.insert_image(fig_rect, stream=fig_bytes)
+                                    page.insert_image(fig_rect, stream=fig_bytes, keep_proportion=True)
                                     page.draw_rect(fig_rect, color=(0.8, 0.84, 0.88), width=0.6)
                                 except Exception:
                                     pass
@@ -811,7 +812,7 @@ class PDFExporter:
 
                         # ── E. Text Paragraphs ─────────────────────────────────
                         else:
-                            p_text = el.get("text") or el.get("content", "")
+                            p_text = clean_display_text(el.get("text") or el.get("content", ""))
                             p_rect = pymupdf.Rect(x0, y0, x1, y1)
                             fs = 9.5
                             while fs >= 6.0:

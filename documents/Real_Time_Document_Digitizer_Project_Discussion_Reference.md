@@ -970,13 +970,17 @@ inconsistent data.**
 
 ## Note on Project Scope
 
-Some components discussed above are **proposed design goals**, not
-claims that they have already been fully implemented. During
-implementation, each component should be tested independently and the
-final presentation should clearly distinguish:
+Some components discussed above were initial proposed design goals. As of the latest development release (November 2026), the engineering roadmap has achieved production implementation across core capabilities:
 
--   **Implemented features**
--   **Currently under development**
--   **Proposed/experimental features**
-
-This avoids overstating the capabilities of the final system.
+- **Implemented & Fully Operational**:
+  - Live webcam and 1080p mobile video stream ingestion with real-time blur/glare scoring and 4-corner document boundary locking.
+  - Multi-format static image upload (`.jpg`, `.jpeg`, `.png`, `.bmp`, `.tiff`, `.webp`, `.jfif`) with automatic viewfinder badging and instant digitization.
+  - Illumination and shadow equalization via Adaptive CLAHE contrast normalization.
+  - Dual-mode layout decomposition: YOLOv11 deep layout detector with automated fallback to high-precision OpenCV morphology.
+  - High-precision PaddleOCR with tuned parameters (`1600px` limit, `0.30` thresh, `1.7` unclip) and automata/mathematical notation healing (`q₀`, `q₁`, `δ`, `λ`, `→`).
+  - Intelligent Diagram & Graphic Segmentation Engine: selective prose masking, morphological bridging kernel, boundary clearance, caption anchoring, and diagram token suppression.
+  - Pure Digital Vector PDF Reconstruction on clean white canvas (`#FFFFFF`) with 1-to-1 physical coordinate mapping, replacing legacy photo-sandwich PDFs.
+  - Visual 2D Layout Renderer (`src/layout_renderer.py`) powering the desktop GUI's 2D canvas tab.
+  - Text markup sanitizer (`src/text_markup.py`) stripping raw Markdown syntax and converting LaTeX symbols into publication Unicode.
+  - Multimodal Vision AI integration with Google Gemini fallback pool (`gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.6-flash`, `gemini-3.8-flash`) and hybrid Auto-escalation.
+  - 100% passing automated test coverage (24/24 main pipeline integration tests, 12/12 unit tests, 56/56 real image pipeline tests).

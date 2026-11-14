@@ -293,7 +293,7 @@ class SmartAIEngine:
                     fig_file = f"figure_smart_{fig_hash}.png"
                     fig_path = os.path.join(fig_dir, fig_file)
                     cv2.imwrite(fig_path, crop)
-                    return f"![{caption}]({fig_path})"
+                    return f"![{caption}]({fig_path}#box={x1},{y1},{x2},{y2})"
 
             # 2. Existing valid file path on disk
             if os.path.exists(uri):
@@ -328,7 +328,7 @@ class SmartAIEngine:
                     fig_file = f"figure_smart_{fig_hash}.png"
                     fig_path = os.path.join(fig_dir, fig_file)
                     cv2.imwrite(fig_path, crop)
-                    return f"![{caption}]({fig_path})"
+                    return f"![{caption}]({fig_path}#box={x1},{y1},{x2},{y2})"
 
                 # If no crop possible (e.g. inline icon), do NOT emit broken image tag
                 return f"> 📷 **Figure:** {caption}"
@@ -416,12 +416,39 @@ class SmartAIEngine:
                 flush_para()
                 m = re.match(r"!\[(.*?)\]\((.*?)\)", line_str)
                 caption = m.group(1) if m else "Figure"
-                img_path = m.group(2) if m else ""
-                elements.append({
+                raw_path = m.group(2) if m else ""
+                box_coords = None
+                img_path = raw_path
+                if "#box=" in raw_path:
+                    img_path, box_str = raw_path.split("#box=", 1)
+                    try:
+                        box_coords = [int(v) for v in box_str.split(",")]
+                    except Exception:
+                        box_coords = None
+
+                el_dict = {
                     "type": "Image",
                     "content": caption,
                     "caption": caption,
                     "image_path": img_path,
+                    "markdown": f"![{caption}]({img_path})",
+                    "confidence": 1.0
+                }
+                if box_coords and len(box_coords) == 4:
+                    el_dict["box"] = box_coords
+                    el_dict["top_y"] = box_coords[1]
+                elements.append(el_dict)
+                continue
+
+            # Fallback text figure callout (e.g. > 📷 **Figure:** ...)
+            if re.match(r"^>\s*(?:📷\s*)?\*?\*?Figure:?\*?\*?", line_str, re.IGNORECASE):
+                flush_para()
+                cap_text = re.sub(r"^>\s*(?:📷\s*)?\*?\*?Figure:?\*?\*?\s*", "", line_str, flags=re.IGNORECASE).strip()
+                elements.append({
+                    "type": "Image",
+                    "content": cap_text or "Figure",
+                    "caption": cap_text or "Figure",
+                    "image_path": "",
                     "markdown": line_str,
                     "confidence": 1.0
                 })

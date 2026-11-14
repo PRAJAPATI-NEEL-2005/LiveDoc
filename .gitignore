@@ -46,4 +46,5 @@ models/*.onnx
 # Generated runtime documents & figures
 documents/figures/
 test_outputs/
+test_pipeline_outputs/
 *.pdf

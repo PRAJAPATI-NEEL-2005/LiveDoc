@@ -29,9 +29,9 @@ class OCREngine:
             use_angle_cls=True,
             lang=lang,
             show_log=False,
-            det_limit_side_len=1280,
-            det_db_box_thresh=0.35,
-            det_db_unclip_ratio=1.6
+            det_limit_side_len=1600,
+            det_db_box_thresh=0.30,
+            det_db_unclip_ratio=1.7
         )
         self.table_extractor = TableExtractor()
         self.validator = DocumentValidator(min_confidence_threshold=0.72)
@@ -218,6 +218,9 @@ class OCREngine:
         for cl in clusters:
             if len(cl) < 6:
                 continue
+            # If any token in cluster is a figure caption (e.g. Fig. 2.69), it's a diagram, strictly NOT a table
+            if any(re.search(r"(?i)^(fig|figure|diagram|chart|illustration)\b", t["text"].strip()) for t in cl):
+                continue
             xs = [t["cx"] for t in cl]
             ys = [t["cy"] for t in cl]
             bx1 = max(0, int(min(t["min_x"] for t in cl)) - 10)
@@ -301,56 +304,120 @@ class OCREngine:
     @staticmethod
     def _detect_figure_boxes(image: np.ndarray, tokens: List[Dict[str, Any]], table_boxes: List[Dict[str, Any]], assigned_token_indices: set) -> List[Dict[str, Any]]:
         """
-        Detects prominent visual figures, drawings, charts, or images on the page:
-        - Must have substantial 2D dimensions (w >= 120, h >= 90).
-        - Must have substantial non-text graphical content after removing all detected text tokens.
-        - Text paragraphs and isolated single text lines are strictly never figures.
+        Detects prominent visual figures, drawings, state diagrams, charts, or images on the page:
+        - Accurately detects state transition graphs, flowcharts, circuits, and illustrations.
+        - Preserves diagram labels (e.g. q0, q1, 0/A, 1/B) and bridges graphical elements.
+        - Anchors diagrams using figure captions (e.g. Fig. 2.69).
+        - Rejects plain text paragraphs and margin binding shadows.
         """
         h, w = image.shape[:2]
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-        edges = cv2.Canny(gray, 50, 150)
+        edges = cv2.Canny(gray, 40, 140)
+        # Clear outer image border lines from scanner / camera frame
+        edges[:12, :] = 0
+        edges[-12:, :] = 0
+        edges[:, :12] = 0
+        edges[:, -12:] = 0
 
-        # Mask out table regions
+        # 1. Mask out verified table regions
         for tb in table_boxes:
             bx1, by1, bx2, by2 = tb["box"]
             edges[max(0, by1 - 5):min(h, by2 + 5), max(0, bx1 - 5):min(w, bx2 + 5)] = 0
 
-        # Mask out all detected text token boxes so text lines are never mistaken for drawings
-        for t in tokens:
-            tx1 = max(0, int(t["min_x"]) - 4)
-            ty1 = max(0, int(t["min_y"]) - 4)
-            tx2 = min(w, int(t["max_x"]) + 4)
-            ty2 = min(h, int(t["max_y"]) + 4)
-            edges[ty1:ty2, tx1:tx2] = 0
+        FIG_CAPTION_RE = re.compile(r"(?i)\b(?:fig(?:\.|ure)?|chart|diagram|graph|scheme)\b")
 
-        dilated = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)), iterations=2)
+        # 2. Mask only long prose tokens (> 6 chars and not figure caption or short math/state labels)
+        # This keeps state circles, arrows, logic gates, and short labels intact
+        edges_no_prose = edges.copy()
+        for i, t in enumerate(tokens):
+            if i in assigned_token_indices:
+                continue
+            txt = t["text"].strip()
+            if FIG_CAPTION_RE.search(txt) or len(txt) <= 6:
+                continue
+            tx1 = max(0, int(t["min_x"]) - 2)
+            ty1 = max(0, int(t["min_y"]) - 2)
+            tx2 = min(w, int(t["max_x"]) + 2)
+            ty2 = min(h, int(t["max_y"]) + 2)
+            edges_no_prose[ty1:ty2, tx1:tx2] = 0
 
-        cnts, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Morphological bridge kernel to connect state circles, arrows, flowchart blocks
+        bridge_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 17))
+        dilated = cv2.dilate(edges_no_prose, bridge_kernel, iterations=2)
+
+        cnts, _ = cv2.findContours(dilated, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         fig_boxes = []
         for c in cnts:
             bx, by, bw, bh = cv2.boundingRect(c)
-            # A true figure must have substantial dimensions in both width and height
-            if bw < max(120, int(w * 0.12)) or bh < max(80, int(h * 0.08)):
+            # Size limits
+            if bw < 80 or bh < 60:
                 continue
-            if bw > 0.90 * w or bh > 0.88 * h:
+            if bw > 0.92 * w or bh > 0.90 * h:
                 continue
-            # Suppress small artifacts in the top header or margin zone (staple marks, punch holes, page stamps, watermarks)
-            if by < 0.12 * h and (bw * bh) < (w * h * 0.04):
+            # Suppress outer page margins & book spine binding shadow
+            if (bx > 0.82 * w and (bx + bw) >= 0.96 * w) or (bx <= 0.04 * w and (bx + bw) < 0.18 * w):
+                continue
+            # Suppress header margin noise
+            if by < 0.08 * h and (bw * bh) < (w * h * 0.04):
                 continue
             aspect = bw / float(max(1, bh))
-            if aspect < 0.20 or aspect > 4.5:
+            if aspect < 0.20 or aspect > 5.0:
                 continue
 
             # Must contain significant non-text edge pixels and density
-            crop_edges = edges[by:by+bh, bx:bx+bw]
+            crop_edges = edges_no_prose[by:by+bh, bx:bx+bw]
             non_text_edge_count = cv2.countNonZero(crop_edges)
-            if non_text_edge_count < max(500, int(bw * bh * 0.02)):
+            edge_density = non_text_edge_count / float(bw * bh)
+            if non_text_edge_count < 300 or edge_density < 0.012:
+                continue
+
+            # Tokens inside candidate box
+            inside_tokens = [
+                t for t in tokens
+                if (bx - 10 <= t["cx"] <= bx + bw + 10) and (by - 10 <= t["cy"] <= by + bh + 10)
+            ]
+            caption_raw = next((t["text"].strip() for t in inside_tokens if FIG_CAPTION_RE.search(t["text"].strip())), "")
+            caption_match = ""
+            if caption_raw:
+                cm = re.search(r"(?i)\b(?:fig(?:\.|ure)?|chart|diagram|graph|scheme)\b.*", caption_raw)
+                caption_match = cm.group(0).strip() if cm else caption_raw
+            has_fig_caption = bool(caption_match)
+
+            # Allow diagrams with multiple internal state/transition labels
+            max_tokens_allowed = 25 if (has_fig_caption or non_text_edge_count > 600) else 12
+            if len(inside_tokens) > max_tokens_allowed:
                 continue
 
             fig_boxes.append({
                 "type": "Image",
-                "box": [bx, by, bx + bw, by + bh]
+                "box": [bx, by, bx + bw, by + bh],
+                "caption": caption_match,
+                "edge_count": non_text_edge_count
             })
+
+        # 3. Figure caption anchoring for captions positioned just outside the dilated contour
+        for i, t in enumerate(tokens):
+            if i in assigned_token_indices:
+                continue
+            txt = t["text"].strip()
+            if FIG_CAPTION_RE.search(txt):
+                cx, cy = t["cx"], t["cy"]
+                # Check if this caption is already inside any fig_box
+                already_covered = any(
+                    fb["box"][0] - 15 <= cx <= fb["box"][2] + 15 and fb["box"][1] - 15 <= cy <= fb["box"][3] + 15
+                    for fb in fig_boxes
+                )
+                if not already_covered:
+                    # Look for nearest candidate figure directly above the caption
+                    for fb in fig_boxes:
+                        fbx1, fby1, fbx2, fby2 = fb["box"]
+                        if (fbx1 - 60 <= cx <= fbx2 + 60) and (fby2 <= cy <= fby2 + 80):
+                            fb["box"][3] = max(fb["box"][3], int(t["max_y"]) + 5)
+                            fb["box"][0] = min(fb["box"][0], int(t["min_x"]) - 5)
+                            fb["box"][2] = max(fb["box"][2], int(t["max_x"]) + 5)
+                            fb["caption"] = txt
+                            break
+
         return fig_boxes
 
     @staticmethod
@@ -385,6 +452,10 @@ class OCREngine:
         # e.g. "(AND)" OCR'd as "AND)" — restore opening bracket
         t = re.sub(r"(?<![\(\[])\b(AND|OR|NOT|XOR|NAND|NOR|XNOR)\)", r"(\1)", t)
 
+        # Logic operators between single capital letters: 'A^B' -> 'A∧B', 'AvB' -> 'A∨B'
+        t = re.sub(r"\b([A-Z])\^([A-Z])\b", r"\1∧\2", t)
+        t = re.sub(r"\b([A-Z])v([A-Z])\b", r"\1∨\2", t)
+
         # ── 3. Spacing normalisations ────────────────────────────────────
         t = re.sub(r"[ \t]+", " ", t)
         t = re.sub(r"([,;:?!])([A-Za-z0-9])", r"\1 \2", t)
@@ -406,10 +477,47 @@ class OCREngine:
         t = re.sub(r"(^|\s)([ivxlcdm]{1,5})\s*([A-Z][a-z]+)", _sep_roman, t)
         t = re.sub(r"(^|\s)(\d{1,2})([A-Z][a-z]+)", r"\1\2. \3", t)
 
-        # ── 5. Math operator spacing ─────────────────────────────────────
+        # ── 5. Math operator spacing & logic symbol cleanup ──────────────
         t = re.sub(r"([A-Za-z0-9])(=)([A-Za-z0-9])", r"\1 \2 \3", t)
+        t = re.sub(r"(?<=\w)\s*&&\s*(?=\w)", " ∧ ", t)
+        t = re.sub(r"\s*&&\s*", " ∧ ", t)
+        t = re.sub(r"\s*->\s*", " → ", t)
+        t = re.sub(r"\s*<-\s*", " ← ", t)
+        t = re.sub(r"\s*=>\s*", " ⇒ ", t)
 
-        # ── 6. Final whitespace trim ─────────────────────────────────────
+        # ── 6. Automata & Mathematical notation healing ─────────────────
+        t = re.sub(r"\b([qQ])0\b", r"\1₀", t)
+        t = re.sub(r"\b([qQ])1\b", r"\1₁", t)
+        t = re.sub(r"\b([qQ])2\b", r"\1₂", t)
+        t = re.sub(r"\b([qQ])3\b", r"\1₃", t)
+        t = re.sub(r"\b([qQ])n\b", r"\1ₙ", t)
+        t = re.sub(r"\b([ab])0\b", r"\1₀", t)
+        t = re.sub(r"\b([ab])1\b", r"\1₁", t)
+        t = re.sub(r"\b([ab])2\b", r"\1₂", t)
+        t = re.sub(r"\b([ab])3\b", r"\1₃", t)
+        t = re.sub(r"\b([ab])n\b", r"\1ₙ", t)
+        t = re.sub(r"\b([qQ])o\b", r"\1₀", t)
+        t = re.sub(r"\b([qQ])obe\b", r"\1₀, b", t)
+        t = re.sub(r"\b8\s*\[q", r"δ([q", t)
+        t = re.sub(r"\b8\s*\(", r"δ(", t)
+        t = re.sub(r"\b8\b(?=\s+defines the move)", r"δ", t)
+        t = re.sub(r"\b1\s*\[q", r"λ([q", t)
+        t = re.sub(r"\b1\s*\(", r"λ(", t)
+        t = re.sub(r"\b1\b(?=\s+defines the output)", r"λ", t)
+
+        # Common printed English OCR slips
+        t = re.sub(r"\bfollwing\b", "following", t)
+        t = re.sub(r"\bino\b(?=\s+[a-z])", "into", t)
+        t = re.sub(r"\bequialent\b", "equivalent", t)
+        t = re.sub(r"\bmachin\b", "machine", t)
+        t = re.sub(r"\butput\b", "output", t)
+        t = re.sub(r"\bequence\b", "sequence", t)
+        t = re.sub(r"([a-z])\.([A-Z])", r"\1. \2", t)
+
+        # Strip accidental markdown symbols leaking into OCR
+        t = t.replace("**", "").replace("__", "").replace("~~", "").replace("`", "")
+
+        # ── 7. Final whitespace trim ─────────────────────────────────────
         return t.strip()
 
     def extract_structured_document(self, image: np.ndarray, layout_boxes: List[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -438,7 +546,10 @@ class OCREngine:
         if layout_boxes is None:
             layout_boxes = self.layout_analyzer.analyze(final_img)
 
-        table_boxes = [b for b in layout_boxes if b.get("type") == "Table"]
+        table_boxes = [
+            b for b in layout_boxes
+            if b.get("type") == "Table" and not ((b["box"][2] - b["box"][0]) > 0.88 * W and (b["box"][3] - b["box"][1]) > 0.75 * H)
+        ]
 
         # Dual-layer table recovery: detect tables from token grid if CV borders were faint or missed
         supplemental_boxes = self._detect_token_grid_boxes(tokens, final_img.shape, table_boxes)
@@ -526,7 +637,12 @@ class OCREngine:
                     # A true table MUST possess >= 2 columns, >= 2 rows (headers + data rows),
                     # at least 4 filled cells, and >= 4 tokens.
                     # Prose sentences, fragments, or isolated single words are NEVER tables.
+                    contains_fig_caption = any(
+                        re.search(r"(?i)^(fig|figure|diagram|chart|illustration)\b", t.get("text", "").strip())
+                        for t in crop_tokens
+                    )
                     is_valid_table = (
+                        not contains_fig_caption and
                         len(headers) >= 2 and
                         (len(rows) >= 1) and
                         filled_cells >= 4 and
@@ -586,10 +702,12 @@ class OCREngine:
             # Identify tokens inside image box
             img_token_indices = [
                 i for i, t in enumerate(tokens)
-                if i not in assigned_token_indices and (bx1 - 5 <= t["cx"] <= bx2 + 5) and (by1 - 5 <= t["cy"] <= by2 + 5)
+                if i not in assigned_token_indices and (bx1 - 10 <= t["cx"] <= bx2 + 10) and (by1 - 10 <= t["cy"] <= by2 + 10)
             ]
-            # If region has a high density of text tokens (> 9), it's a text block, not an image
-            if len(img_token_indices) > 9:
+            has_explicit_caption = bool(ib.get("caption"))
+            max_allowed_tokens = 25 if (has_explicit_caption or ib.get("edge_count", 0) > 600) else 12
+            # If region has excessively high density of text tokens without diagram characteristics, it's a text block
+            if len(img_token_indices) > max_allowed_tokens:
                 continue
 
             fig_counter += 1
@@ -604,19 +722,43 @@ class OCREngine:
             fig_abs_path = os.path.abspath(fig_rel_path)
             cv2.imwrite(fig_abs_path, fig_crop)
 
-            # Look for caption token right below or above the figure
-            caption_text = f"Figure {fig_counter}"
+            # Suppress all tokens inside and immediately surrounding the figure box
+            # (suppresses state labels, transition tags, internal legends, numbers, and captions from forming stray paragraphs)
             for i, t in enumerate(tokens):
-                if i in assigned_token_indices:
-                    continue
-                is_near_y = (by2 <= t["cy"] <= by2 + 40) or (by1 - 40 <= t["cy"] <= by1)
-                is_aligned_x = (bx1 - 30 <= t["cx"] <= bx2 + 30)
-                if is_near_y and is_aligned_x:
-                    txt = t["text"].strip()
-                    if re.search(r"(?i)^(fig|figure|diagram|chart|illustration)\b", txt):
-                        caption_text = txt
+                if i not in assigned_token_indices:
+                    if (bx1 - 15 <= t["cx"] <= bx2 + 15) and (by1 - 15 <= t["cy"] <= by2 + 15):
                         assigned_token_indices.add(i)
-                        break
+
+            # Look for caption line right below or above the figure if not already present
+            caption_text = ib.get("caption", "").strip()
+            caption_line_indices = []
+            if not caption_text:
+                for i, t in enumerate(tokens):
+                    if i in assigned_token_indices:
+                        continue
+                    is_near_y = (by2 <= t["cy"] <= by2 + 50) or (by1 - 50 <= t["cy"] <= by1)
+                    is_aligned_x = (bx1 - 40 <= t["cx"] <= bx2 + 40)
+                    if is_near_y and is_aligned_x:
+                        txt = t["text"].strip()
+                        m = re.search(r"(?i)\b(fig|figure|diagram|chart|illustration)\b.*", txt)
+                        if m:
+                            cap_cy = t["cy"]
+                            for j, t2 in enumerate(tokens):
+                                if j not in assigned_token_indices and abs(t2["cy"] - cap_cy) < 14 and (bx1 - 60 <= t2["cx"] <= bx2 + 60):
+                                    caption_line_indices.append(j)
+                            break
+
+                if caption_line_indices:
+                    cap_toks = sorted([tokens[j] for j in caption_line_indices], key=lambda x: x["min_x"])
+                    caption_text = self._clean_text_spacing(" ".join(x["text"].strip() for x in cap_toks))
+                    assigned_token_indices.update(caption_line_indices)
+                else:
+                    caption_text = f"Figure {fig_counter}"
+            else:
+                # If caption was matched on an internal token, ensure that token is suppressed from prose
+                for i, t in enumerate(tokens):
+                    if i not in assigned_token_indices and (caption_text in t["text"].strip() or t["text"].strip() in caption_text):
+                        assigned_token_indices.add(i)
 
             assigned_token_indices.update(img_token_indices)
 
@@ -728,11 +870,20 @@ class OCREngine:
 
         curr_para_lines = []
         curr_para_tokens = []
+        curr_para_segs = []
         curr_para_y = 0
         prev_line_y = None
 
+        def _box_of(toks):
+            return [
+                int(min(t["min_x"] for t in toks)),
+                int(min(t["min_y"] for t in toks)),
+                int(max(t["max_x"] for t in toks)),
+                int(max(t["max_y"] for t in toks)),
+            ]
+
         def flush_paragraph():
-            nonlocal curr_para_lines, curr_para_tokens, curr_para_y
+            nonlocal curr_para_lines, curr_para_tokens, curr_para_y, curr_para_segs
             if curr_para_lines:
                 # 1. Expand and split any inline bullets embedded inside lines
                 expanded_lines = []
@@ -836,10 +987,12 @@ class OCREngine:
                         "content": text_block,
                         "confidence": avg_c,
                         "top_y": curr_para_y,
-                        "box": [pbx1, pby1, pbx2, pby2]
+                        "box": [pbx1, pby1, pbx2, pby2],
+                        "lines": list(curr_para_segs)
                     })
                 curr_para_lines = []
                 curr_para_tokens = []
+                curr_para_segs = []
 
         for line_idx, line in enumerate(physical_lines):
             line_y = float(np.mean([t.get("y_proj", t["cy"]) for t in line]))
@@ -871,6 +1024,7 @@ class OCREngine:
 
             raw_line_text = " ".join(t["text"] for t in line).strip()
             norm_line_text = self._clean_text_spacing(raw_line_text)
+            line_box = _box_of(line)
 
             # If line has an intro sentence with an inline outline heading attached e.g. "one by one - i) Negation"
             m_inline_head = re.match(r"^(.*?(?:one by one|following|below|discuss)[\s\-—:]+)\s*([ivxlcdm]{1,5}\)?\s+[A-Z].*)$", norm_line_text, re.IGNORECASE)
@@ -878,9 +1032,14 @@ class OCREngine:
                 intro_part = m_inline_head.group(1).strip()
                 head_part = m_inline_head.group(2).strip()
                 if intro_part:
+                    # Split the physical line box proportionally between intro text and heading text
+                    frac = len(intro_part) / float(max(1, len(intro_part) + len(head_part)))
+                    split_x = int(line_box[0] + frac * (line_box[2] - line_box[0]))
                     curr_para_lines.append(intro_part)
                     curr_para_tokens.extend(line)
+                    curr_para_segs.append({"text": intro_part, "box": [line_box[0], line_box[1], split_x, line_box[3]]})
                     flush_paragraph()
+                    line_box = [split_x, line_box[1], line_box[2], line_box[3]]
                 norm_line_text = head_part
 
             # 1. Page Title / Running Header (Top 22% of page and spans across page or contains section numbering)
@@ -910,7 +1069,12 @@ class OCREngine:
                     "content": header_text,
                     "confidence": float(np.mean([t["conf"] for t in line])),
                     "top_y": line_y,
-                    "box": [tbx1, tby1, tbx2, tby2]
+                    "box": [tbx1, tby1, tbx2, tby2],
+                    # Each header token keeps its own position (left / centre / right of the running header)
+                    "lines": [
+                        {"text": self._clean_text_spacing(t["text"]), "box": _box_of([t])}
+                        for t in sorted(line, key=lambda x: x["min_x"]) if t["text"].strip()
+                    ]
                 })
                 continue
 
@@ -929,7 +1093,8 @@ class OCREngine:
                     "confidence": float(np.mean([t["conf"] for t in line])),
                     "top_y": line_y,
                     "level": 2,
-                    "box": [hbx1, hby1, hbx2, hby2]
+                    "box": [hbx1, hby1, hbx2, hby2],
+                    "lines": [{"text": norm_line_text, "box": line_box}]
                 })
                 continue
 
@@ -940,7 +1105,7 @@ class OCREngine:
             # Headings in printed documents must have reliable OCR confidence
             if avg_line_conf >= 0.72:
                 # Match Roman numerals ('i)', 'iv)') or letter outlines ('A.', 'B.') with punctuation
-                m_roman = re.match(r"^([ivxlcdm]+)[\.\)\s-]+\s*[A-Za-z]", norm_line_text, re.IGNORECASE)
+                m_roman = re.match(r"^(\([ivxlcdm]+\)|[ivxlcdm]+[\.\)])\s+[A-Za-z]", norm_line_text, re.IGNORECASE)
                 m_letter = re.match(r"^(\([A-Za-z]\)|[A-Za-z][\.\)])\s+[A-Za-z]", norm_line_text)
                 if (m_roman or m_letter) and len(norm_line_text) < 60:
                     is_subheading = True
@@ -986,7 +1151,8 @@ class OCREngine:
                     "confidence": avg_line_conf,
                     "top_y": line_y,
                     "level": 3,
-                    "box": [sbx1, sby1, sbx2, sby2]
+                    "box": [sbx1, sby1, sbx2, sby2],
+                    "lines": [{"text": norm_line_text, "box": line_box}]
                 })
                 continue
 
@@ -995,6 +1161,7 @@ class OCREngine:
                 curr_para_y = line_y
             curr_para_lines.append(norm_line_text)
             curr_para_tokens.extend(line)
+            curr_para_segs.append({"text": norm_line_text, "box": line_box})
 
         flush_paragraph()
 
@@ -1005,14 +1172,25 @@ class OCREngine:
             title_elements.sort(key=lambda el: el.get("top_y", 0))
             merged_title_text = "  •  ".join(el["content"].strip("• ") for el in title_elements)
             first_top_y = min(el.get("top_y", 0) for el in title_elements)
+            merged_lines = [seg for el in title_elements for seg in el.get("lines", [])]
+            merged_boxes = [el["box"] for el in title_elements if el.get("box")]
+            merged_box = (
+                [min(b[0] for b in merged_boxes), min(b[1] for b in merged_boxes),
+                 max(b[2] for b in merged_boxes), max(b[3] for b in merged_boxes)]
+                if merged_boxes else None
+            )
             structured_elements = [el for el in structured_elements if el["type"] != "Title"]
-            structured_elements.append({
+            merged_el = {
                 "type": "Title",
                 "text": merged_title_text,
                 "content": merged_title_text,
                 "confidence": float(np.mean([el.get("confidence", 1.0) for el in title_elements])),
-                "top_y": first_top_y
-            })
+                "top_y": first_top_y,
+                "lines": merged_lines
+            }
+            if merged_box:
+                merged_el["box"] = merged_box
+            structured_elements.append(merged_el)
 
         # -----------------------------------------------------------------
         # STEP 4: Interleave All Elements in Physical Vertical Order

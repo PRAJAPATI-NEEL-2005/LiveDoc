@@ -11,7 +11,12 @@ Supports YOLOv11 deep-learning model (when models/yolo11_doc.pt is present)
 and an intelligent, high-precision Computer Vision morphological layout engine as fallback.
 """
 
-from ultralytics import YOLO
+try:
+    from ultralytics import YOLO
+    _YOLO_AVAILABLE = True
+except (ImportError, OSError, Exception):
+    _YOLO_AVAILABLE = False
+    YOLO = None
 import cv2
 import os
 import numpy as np
@@ -23,7 +28,7 @@ class LayoutAnalyzer:
         self.use_yolo = False
         self.model_path = model_path
 
-        if os.path.exists(model_path):
+        if _YOLO_AVAILABLE and os.path.exists(model_path):
             try:
                 print(f"Loading YOLO document model from {model_path}...")
                 self.model = YOLO(model_path)
@@ -161,7 +166,7 @@ class LayoutAnalyzer:
         for c in table_cnts:
             bx, by, bw, bh = cv2.boundingRect(c)
             # Table must have notable dimensions
-            if bw > (w * 0.10) and bh > (h * 0.030):
+            if (bw > (w * 0.10) and bh > (h * 0.030)) and not (bw > (w * 0.88) and bh > (h * 0.75)):
                 # Ignore running header rule lines at the top of the page (aspect ratio > 6.0 touching top margin)
                 if by < 0.08 * h and (bw / float(max(1, bh))) > 5.5:
                     continue

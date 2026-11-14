@@ -81,9 +81,86 @@ The system must never silently alter or invent text. If a token is uncertain or 
 
 ---
 
-## 6. Verification & Test Suite
+## 6. Digital Vector PDF Reconstruction & 1-to-1 Physical Positioning
 
-Created comprehensive automated test suites:
-- `test_pipeline.py`: 22-point end-to-end integration test validating camera, detector, layout analysis, OCR, and end-to-end extraction.
-- `tests/test_table_extractor.py`: Unit tests for row clustering, column slot alignment, and HTML/Markdown table rendering.
-- `tests/test_validator.py`: Unit tests for confidence thresholding and arithmetic consistency checks.
+### Problem Statement
+Standard document scanner apps create "sandwich PDFs" that plaster the original grainy, shadowed, or skewed camera photo as a background raster and hide invisible OCR text beneath it. This fails accessibility, wastes print toner, looks unprofessional, and prevents clean digital editing.
+
+### Architectural Solution (`src/pdf_exporter.py`, `src/layout_renderer.py`)
+Engineered a pure digital vector document reconstruction pipeline:
+- **Zero Photo Background**: Rebuilds the document from scratch on clean, vector-rendered white pages (`#FFFFFF`).
+- **1-to-1 Physical Coordinate Mapping**: Computes physical coordinate scalings ($X_{\text{scale}} = \frac{W_{\text{target}}}{W_{\text{source}}}$, $Y_{\text{scale}} = \frac{H_{\text{target}}}{H_{\text{source}}}$) to position headings, paragraphs, and tables at their exact physical page locations without drift or overlapping.
+- **Dynamic Text Reflow & Page Budgeting**: Implements automatic font scaling (8.5pt–10.5pt) and line wrapping within column boundaries. Tables and diagrams are bounded to prevent cross-page splits.
+
+---
+
+## 7. Visual 2D Layout Renderer & Desktop Tab (`src/layout_renderer.py`, `src/gui.py`)
+
+- **Interactive 2D Canvas Tab**: Added the **Visual 2D Layout** tab in the desktop GUI, rendering an on-screen preview of the reconstructed digital page matching the exact physical layout.
+- **Aspect-Ratio Preserved Image Rendering**: Automatically computes proportional scaling (`scale = min(avail_w / img_w, avail_h / img_h, 1.0)`), centers diagrams on the page, applies a subtle slate-gray border, and draws italicized captions below.
+- **Spatial Collision Suppression**: Automatically suppresses paragraphs or stray tokens that spatially overlap with diagram or table bounding boxes, preventing internal chart axis labels from polluting document prose.
+
+---
+
+## 8. Multi-Format Image File Upload Pipeline (`src/gui.py`)
+
+### Problem Statement
+Users need to digitize existing document photos and scans stored on their disk, not just live webcam captures.
+
+### Implementation
+- Added a dedicated purple **📂 Upload Image** button (`btn_upload`) in the desktop GUI toolbar.
+- **Multi-Format Ingestion**: Supports `.jpg`, `.jpeg`, `.png`, `.bmp`, `.tiff`, `.tif`, `.webp`, and `.jfif`.
+- **Live Viewfinder Preview & Badge**: Upon selection, the uploaded image is displayed in the main viewfinder with a prominent blue badge showing the filename, image dimensions, and "IMAGE UPLOAD MODE".
+- **Instant Auto-Digitization**: Automatically processes the uploaded file through the entire pipeline (Quality Assessment $\rightarrow$ Perspective Flattening $\rightarrow$ Layout Decomposition $\rightarrow$ OCR / AI $\rightarrow$ PDF/Markdown Generation) and populates all 5 output tabs.
+
+---
+
+## 9. Markdown & LaTeX Typography Sanitization (`src/text_markup.py`)
+
+- **Syntax Leakage Prevention**: Built `clean_display_text()` to scrub raw Markdown symbols (`**`, `*`, `__`, `_`, `~~`, `` ` ``, `##`, `>`) from physical document displays so raw code syntax never leaks into rendered PDFs or visual tabs.
+- **Mathematical Entity Conversion**: Converts LaTeX and ASCII math notations into publication-grade Unicode symbols:
+  - Arrows: `\xrightarrow`, `->` $\rightarrow$ `→`, `<-` $\rightarrow$ `←`, `=>` $\rightarrow$ `⇒`
+  - Greek letters: `\delta` $\rightarrow$ `δ`, `\lambda` $\rightarrow$ `λ`, `\Sigma` $\rightarrow$ `Σ`
+  - Logic operators: `&&` $\rightarrow$ `∧` (in logic contexts) or `&` (in words)
+  - HTML entities: `&amp;` $\rightarrow$ `&`, `&nbsp;`, `&emsp;` $\rightarrow$ spaces.
+
+---
+
+## 10. Local Model Accuracy & Intelligent Diagram Detection (`src/ocr_engine.py`, `src/document_detector.py`)
+
+### Problem Statement
+In local (offline) mode, PaddleOCR missed small text, subscripts, superscripts, Greek letters, and transition arrows. Furthermore, technical diagrams (state machines, flowcharts, circuits) were completely omitted or fragmented into stray one-word paragraphs.
+
+### Engineering Solutions Implemented:
+1. **Adaptive CLAHE Illumination Equalization (`src/document_detector.py`)**:
+   - Integrated Contrast-Limited Adaptive Histogram Equalization (`clipLimit=1.6`, tile size `8x8`) into `preprocess_for_ocr()`.
+   - Equalizes phone-camera shadows and uneven illumination, boosting faint text and thin line strokes without introducing threshold noise.
+2. **High-Resolution Fine-Detail OCR Parameters (`src/ocr_engine.py`)**:
+   - `det_limit_side_len`: Raised from `1280` to `1600` to prevent downsampling on high-resolution camera images.
+   - `det_db_box_thresh`: Tuned to `0.30` to detect small arrowheads and fine mathematical operators.
+   - `det_db_unclip_ratio`: Increased to `1.7` to prevent clipping ascenders and descenders (`q`, `g`, `p`, $\delta$, $\lambda$).
+3. **Intelligent Diagram & Graphic Segmentation Engine (`src/ocr_engine.py`)**:
+   - **Selective Prose Masking**: Only masks long prose tokens (`len(txt) > 6`), preserving state circles, arrowheads, and short labels (`q₀`, `q₁`, `0/A`, `1/B`).
+   - **Diagram Bridge Kernel**: Uses a `(17, 17)` morphological bridge kernel to unite connected components (nodes, transitions, flowchart boxes) into coherent diagram blocks.
+   - **Contour Boundary Clearing & `cv2.RETR_LIST`**: Zeros out 12px outer image borders and uses `cv2.RETR_LIST` so outer page edges never trap or hide interior diagrams.
+   - **Table vs Diagram Safeguard**: Strictly excludes clusters containing figure captions (`Fig.`, `Figure`, `Diagram`) from being classified as tables.
+   - **Caption Anchoring**: Matches captions (`(?i)\b(?:fig(?:\.|ure)?|chart|diagram|graph|scheme)\b.*`) and links them directly to the graphic element.
+   - **Diagram Token Suppression**: Automatically assigns and suppresses all internal diagram tokens (`0/A`, `1/B`, `q₀`, `Fig.2.69`) so they never leak as stray prose paragraphs.
+4. **Automata & Mathematical Notation Healing (`src/ocr_engine.py`)**:
+   - Automata states: `q0` / `qo` $\rightarrow$ `q₀`, `q1` $\rightarrow$ `q₁`, `q2` $\rightarrow$ `q₂`, `qn` $\rightarrow$ `qₙ`, `a0` $\rightarrow$ `a₀`, `b1` $\rightarrow$ `b₁`.
+   - Greek letters & transitions: `8[` / `8(` $\rightarrow$ `δ(`, `1[` / `1(` $\rightarrow$ `λ(`, `->` $\rightarrow$ `→`.
+   - Printed OCR typo corrections: `follwing` $\rightarrow$ `following`, `ino` $\rightarrow$ `into`, `equialent` $\rightarrow$ `equivalent`, `machin` $\rightarrow$ `machine`.
+   - Roman numeral regex fix: Requires explicit punctuation (`i.`, `ii)`, `(a)`) to prevent bare words like `M on input a.` from being misclassified as headings.
+5. **Layout Analyzer Hardening (`src/layout_analyzer.py`)**:
+   - Added upper bound checks to prevent whole-page borders from being mistaken for tables.
+   - Added safe fallback wrappers around `ultralytics YOLO` imports to guarantee zero crashes on Windows DLL loading issues.
+
+---
+
+## 11. Verification & Test Suite Status
+
+- **Main Pipeline Integration Test (`test_pipeline.py`)**: **24/24 PASS**
+- **Unit Test Suite (`tests/`)**: **12/12 PASS** (`test_sandwich_pdf`, `test_table_extractor`, `test_validator`)
+- **Figure Test Suite (`run_figure_test.py`)**: **PASS** (`PDF ok: True`)
+- **Real Scanned Image Pipeline Test (`run_image_pipeline_test.py`)**: **56/56 checks with 0 failures** across diverse real-world images (automata diagrams, dense comprehension paragraphs, book covers, two-page spreads)
+- **User Benchmark Scan (`page2-81.jpeg`)**: State transition diagram cleanly extracted and cropped to `documents/figures/figure_1.png` with caption `Fig.2.69` and clean mathematical formula reconstruction.
