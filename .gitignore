@@ -43,7 +43,8 @@ models/*.pth
 models/*.onnx
 !models/.gitkeep
 
-# Generated figures and user configs
+# Generated runtime documents & figures
 documents/figures/
-config.json
-anaconda_projects/
+test_outputs/
+test_pipeline_outputs/
+*.pdf

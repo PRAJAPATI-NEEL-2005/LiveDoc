@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
     QTextEdit, QTextBrowser, QHBoxLayout, QVBoxLayout, QSplitter,
     QStatusBar, QProgressBar, QFrame, QSizePolicy, QComboBox,
-    QTabWidget, QFileDialog, QMessageBox, QDialog, QLineEdit, QCheckBox
+    QTabWidget, QFileDialog, QMessageBox, QDialog, QLineEdit, QCheckBox, QScrollArea
 )
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize
 from PyQt6.QtGui import QImage, QPixmap, QFont, QColor, QPalette, QIcon
@@ -40,6 +40,7 @@ from src.layout_analyzer import LayoutAnalyzer
 from src.ocr_engine import OCREngine
 from src.smart_ai_engine import SmartAIEngine
 from src.pdf_exporter import PDFExporter
+from src.layout_renderer import render_page_pixmap, export_pdf as export_layout_pdf
 
 
 # ─────────────────────────────────────────────────────────
@@ -218,6 +219,13 @@ class ScanWorker(QThread):
                     )
                 try:
                     doc_data = self.smart_ai_engine.transcribe_document(flat)
+                    # Supplement with OCR token coordinates for Dual-Layer Searchable PDF positioning
+                    if not doc_data.get("tokens") and self.ocr_engine:
+                        try:
+                            raw_ocr, _ = self.ocr_engine._get_best_ocr(flat)
+                            doc_data["tokens"] = self.ocr_engine._parse_tokens(raw_ocr)
+                        except Exception:
+                            pass
                 except Exception as ai_err:
                     # Seamless fallback: if cloud servers are experiencing high demand (503) or offline,
                     # don't leave the user with an error screen! Digitized with the offline engine immediately:
@@ -251,6 +259,8 @@ class ScanWorker(QThread):
                         )
                         try:
                             ai_doc = self.smart_ai_engine.transcribe_document(flat)
+                            if not ai_doc.get("tokens") and doc_data.get("tokens"):
+                                ai_doc["tokens"] = doc_data["tokens"]
                             doc_data = ai_doc
                             doc_data["escalated_from_offline"] = True
                             doc_data["original_offline_score"] = score
@@ -277,7 +287,7 @@ class LiveDocApp(QMainWindow):
         self.setMinimumSize(1320, 820)
 
         # Backend objects
-        self.camera = LiveCameraManager(0)
+        self.camera = LiveCameraManager(camera_index=None)
         self.available_cameras = []
         self.detector = DocumentDetector()
         self.analyzer = LayoutAnalyzer()
@@ -299,6 +309,7 @@ class LiveDocApp(QMainWindow):
         self.all_pages_markdown = []
         self.all_pages_html = []
         self.all_pages_elements = []
+        self.all_pages_data = []
 
         self._apply_stylesheet()
         self._build_ui()
@@ -407,6 +418,14 @@ class LiveDocApp(QMainWindow):
             }
             QPushButton#btn_export:hover {
                 background-color: #0369a1;
+            }
+            QPushButton#btn_upload {
+                background-color: #7c3aed;
+                color: #ffffff;
+                font-weight: bold;
+            }
+            QPushButton#btn_upload:hover {
+                background-color: #6d28d9;
             }
             QPushButton#btn_pdf {
                 background-color: #dc2626;
@@ -590,6 +609,17 @@ class LiveDocApp(QMainWindow):
 
         self.tabs = QTabWidget()
 
+        # Tab 0: Physical Document View (2D Visual Layout with exact element bounding boxes)
+        self.tab_visual_scroll = QScrollArea()
+        self.tab_visual_scroll.setWidgetResizable(True)
+        self.tab_visual_scroll.setStyleSheet("background-color: #161b22; border: none;")
+        self.tab_visual_label = QLabel()
+        self.tab_visual_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.tab_visual_label.setText("Physical document layout with exact 2D element coordinates will render here after scanning...")
+        self.tab_visual_label.setStyleSheet("color: #94a3b8; font-size: 13px; padding: 25px;")
+        self.tab_visual_scroll.setWidget(self.tab_visual_label)
+        self.tabs.addTab(self.tab_visual_scroll, "  Visual 2D Layout  ")
+
         # Tab 1: Formatted Document (Rich HTML)
         self.tab_formatted = QTextBrowser()
         self.tab_formatted.setOpenExternalLinks(True)
@@ -657,6 +687,12 @@ class LiveDocApp(QMainWindow):
         self.btn_rotate.setObjectName("btn_secondary")
         self.btn_rotate.clicked.connect(self._rotate_view)
 
+        self.btn_upload = QPushButton("  📂 Upload Image")
+        self.btn_upload.setObjectName("btn_upload")
+        self.btn_upload.setMinimumWidth(150)
+        self.btn_upload.setToolTip("Upload an image file (JPG, PNG, TIFF, BMP) and digitize it")
+        self.btn_upload.clicked.connect(self._upload_image)
+
         # Scan Mode selection
         mode_label = QLabel("Mode:")
         mode_label.setStyleSheet("color: #38bdf8; font-weight: bold;")
@@ -697,6 +733,7 @@ class LiveDocApp(QMainWindow):
         ctrl_layout.addSpacing(4)
         ctrl_layout.addWidget(self.btn_camera)
         ctrl_layout.addWidget(self.btn_rotate)
+        ctrl_layout.addWidget(self.btn_upload)
         ctrl_layout.addSpacing(8)
         ctrl_layout.addWidget(mode_label)
         ctrl_layout.addWidget(self.mode_combo)
@@ -744,18 +781,17 @@ class LiveDocApp(QMainWindow):
         cam_index = self.available_cameras[combo_index][0]
         cam_label = self.available_cameras[combo_index][1]
 
-        was_running = self.camera_running
-        if was_running:
+        if self.camera_running:
             self.timer.stop()
-
-        success = self.camera.switch_camera(cam_index)
-        if success:
-            self.status_bar.showMessage(f"Switched to {cam_label}")
+            success = self.camera.switch_camera(cam_index)
+            if success:
+                self.timer.start(33)
+                self.status_bar.showMessage(f"Switched to {cam_label}")
+            else:
+                self.status_bar.showMessage(f"Could not open {cam_label}")
         else:
-            self.status_bar.showMessage(f"Could not open {cam_label}")
-
-        if was_running and success:
-            self.timer.start(40)
+            self.camera.camera_index = cam_index
+            self.status_bar.showMessage(f"Selected {cam_label}")
 
     # ── Camera Timer ────────────────────────────────────────
     def _setup_camera_timer(self):
@@ -764,16 +800,31 @@ class LiveDocApp(QMainWindow):
 
     def toggle_camera(self, checked):
         if checked:
+            cam_idx = self.cam_combo.currentData()
+            if cam_idx is None:
+                cam_idx = 0
+
+            self.status_bar.showMessage(f"Connecting to Camera {cam_idx}...")
+            QApplication.processEvents()
+
+            success = self.camera.open(cam_idx)
+            if not success or not self.camera.is_opened():
+                self.btn_camera.setChecked(False)
+                self.btn_camera.setText("  Start Camera")
+                self.status_bar.showMessage(f"Error: Could not open Camera {cam_idx}. Try another camera.")
+                return
+
             self.btn_camera.setText("  Stop Camera")
             self.camera_running = True
             self.btn_scan.setEnabled(True)
-            self.timer.start(40)
+            self.timer.start(33)
             self.status_bar.showMessage("Camera running — position document in frame")
         else:
             self.btn_camera.setText("  Start Camera")
             self.camera_running = False
             self.btn_scan.setEnabled(False)
             self.timer.stop()
+            self.camera.release()
             self.cam_label.clear()
             self.cam_label.setText("Camera Off\n\nClick 'Start Camera' to begin")
             self._set_badge("off")
@@ -785,6 +836,8 @@ class LiveDocApp(QMainWindow):
         self.status_bar.showMessage(f"Camera rotated to {self.rotation_angle}°")
 
     def _update_frame(self):
+        if not self.camera_running:
+            return
         frame = self.camera.get_frame()
         if frame is None:
             return
@@ -928,6 +981,75 @@ class LiveDocApp(QMainWindow):
         self.scan_worker.status_update.connect(self.status_bar.showMessage)
         self.scan_worker.start()
 
+    def _render_annotated_document(self, flat_img, elements: list, tokens: list, doc_data: dict = None):
+        """
+        Visual 2D Layout: clean digital reconstruction of the page.
+        White background, every text line / table / figure drawn at the position
+        it had on the physical page. Uses the same renderer as the PDF export.
+        """
+        try:
+            page = {
+                "elements": elements,
+                "image_shape": (doc_data or {}).get("image_shape") or (flat_img.shape[:2] if flat_img is not None else None),
+            }
+            target_w = max(550, min(900, self.tab_visual_scroll.width() - 25))
+            pix = render_page_pixmap(page, target_w)
+            self.tab_visual_label.setPixmap(pix)
+            self.tab_visual_label.setText("")
+        except Exception as e:
+            print(f"Error rendering visual document: {e}")
+
+    # ── Image Upload ──────────────────────────────────────
+    def _upload_image(self):
+        """Open a file dialog, load the image, preview it, and auto-digitize."""
+        file_filter = (
+            "Image Files (*.jpg *.jpeg *.png *.bmp *.tiff *.tif *.webp *.jfif);;"
+            "All Files (*)"
+        )
+        img_path, _ = QFileDialog.getOpenFileName(
+            self, "Upload Image to Digitize", "", file_filter
+        )
+        if not img_path:
+            return  # User cancelled
+
+        # Read with OpenCV (handles all common image formats)
+        frame = cv2.imread(img_path)
+        if frame is None:
+            QMessageBox.critical(
+                self, "Image Load Error",
+                f"Could not read the image file:\n{img_path}\n\n"
+                "Please make sure it is a valid image (JPG, PNG, BMP, TIFF, etc.)."
+            )
+            return
+
+        # Store frame so scan_document() picks it up
+        self.current_frame = frame.copy()
+        self._uploaded_image_path = img_path
+
+        # Show thumbnail preview in the camera feed label
+        lbl_w = max(self.cam_label.width(), 320)
+        lbl_h = max(self.cam_label.height(), 240)
+        fh, fw = frame.shape[:2]
+        scale = min(lbl_w / float(fw), lbl_h / float(fh))
+        nw, nh = max(1, int(fw * scale)), max(1, int(fh * scale))
+        thumb = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        import os as _os
+        fname = _os.path.basename(img_path)
+        # Draw a small label on the preview so the user knows which file is loaded
+        cv2.putText(thumb, f"Uploaded: {fname}", (10, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 220, 100), 2, cv2.LINE_AA)
+        rgb = cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB)
+        qimg = QImage(rgb.data, nw, nh, 3 * nw, QImage.Format.Format_RGB888)
+        self.cam_label.setPixmap(QPixmap.fromImage(qimg))
+        self.cam_label.setText("")
+
+        # Enable Scan button (works even when camera is off) and auto-digitize
+        self.btn_scan.setEnabled(True)
+        self.status_bar.showMessage(
+            f"Image loaded: {img_path}  —  digitizing now..."
+        )
+        self.scan_document()
+
     def _on_scan_result(self, doc_data, flat_img):
         self.progress.setVisible(False)
         self.btn_scan.setEnabled(True)
@@ -955,6 +1077,19 @@ class LiveDocApp(QMainWindow):
         self.all_pages_markdown.append(f"<!-- Page {self.page_count} -->\n" + page_md)
         self.all_pages_html.append(f'<div style="border-bottom: 2px solid #30363d; margin: 20px 0; padding-bottom: 15px;"><span style="background: #1e40af; color: #fff; padding: 3px 8px; border-radius: 4px; font-size: 11px;">PAGE {self.page_count}</span></div>' + page_html)
         self.all_pages_elements.extend(elements)
+        self.all_pages_data.append({
+            "image": flat_img.copy() if flat_img is not None else None,
+            "tokens": doc_data.get("tokens", []),
+            "elements": elements,
+            "title": doc_data.get("title", f"Page {self.page_count}"),
+            "markdown": page_md,
+            "html": page_html,
+            "page_num": self.page_count
+        })
+
+        # 0. Update Visual 2D Document Layout Tab
+        if flat_img is not None:
+            self._render_annotated_document(flat_img, elements, doc_data.get("tokens", []), doc_data)
 
         # 1. Update Formatted Document Tab
         combined_html = "".join(self.all_pages_html)
@@ -1054,10 +1189,22 @@ class LiveDocApp(QMainWindow):
         try:
             combined_md = "\n\n---\n\n".join(self.all_pages_markdown)
             title = self.latest_doc.get("title", "Digitized Document") if self.latest_doc else "Digitized Document"
-            ok = PDFExporter.markdown_to_pdf(combined_md, path, doc_title=title)
+
+            # Export as clean structured digital PDF:
+            # Properly typeset flowing document - headings bold & coloured,
+            # tables formatted, paragraphs justified, no camera image anywhere
+            ok = export_layout_pdf(self.all_pages_data, path, title=title)
             if ok:
-                self.status_bar.showMessage(f"Document successfully saved as PDF: {path}")
-                QMessageBox.information(self, "PDF Saved", f"Successfully saved PDF to:\n{path}")
+                self.status_bar.showMessage(f"Digital PDF saved: {path}")
+                QMessageBox.information(
+                    self, "PDF Saved",
+                    f"Successfully saved structured digital PDF to:\n{path}\n\n"
+                    "• Pure white background — zero camera image\n"
+                    "• Properly structured: Title, Headings, Paragraphs, Tables\n"
+                    "• Headings in blue bold, body text justified\n"
+                    "• Tables with styled header rows and borders\n"
+                    "• Searchable and copy-pasteable text"
+                )
             else:
                 QMessageBox.critical(self, "Export Error", "Failed to generate PDF document.")
         except Exception as e:
@@ -1082,7 +1229,8 @@ class LiveDocApp(QMainWindow):
             if "*.pdf" in selected_filter or path.lower().endswith(".pdf"):
                 if not path.lower().endswith(".pdf"):
                     path += ".pdf"
-                ok = PDFExporter.markdown_to_pdf(combined_md, path, doc_title=title)
+                # Clean structured typeset PDF - no camera image
+                ok = export_layout_pdf(self.all_pages_data, path, title=title)
                 if not ok:
                     raise RuntimeError("Failed to generate PDF.")
             elif "*.json" in selected_filter or path.lower().endswith(".json"):
@@ -1109,6 +1257,9 @@ class LiveDocApp(QMainWindow):
         self.all_pages_markdown = []
         self.all_pages_html = []
         self.all_pages_elements = []
+        self.all_pages_data = []
+        self.tab_visual_label.setPixmap(QPixmap())
+        self.tab_visual_label.setText("Physical document layout with exact 2D element coordinates will render here after scanning...")
         self.page_count = 0
         self.status_bar.showMessage("Results cleared.")
 

@@ -25,8 +25,12 @@ LiveDoc features a versatile tri-mode processing engine that balances speed, pri
 
 1. **🖥️ Local (Offline Mode)**:
    - Operates 100% locally on your CPU/GPU with zero internet connection or API keys required.
-   - Leverages OpenCV morphological kernels for border detection and PaddleOCR for text and table extraction.
-   - Ideal for standard reports, printed invoices, receipts, and confidentiality-restricted documents.
+   - **Adaptive Contrast Equalization**: Integrates CLAHE (`clipLimit=1.6`, tile size `8x8`) to eliminate camera shadows and enhance faint text and thin line strokes.
+   - **High-Precision OCR**: Upgraded PaddleOCR parameters (`det_limit_side_len=1600`, `det_db_box_thresh=0.30`, `det_db_unclip_ratio=1.7`) for superior recognition of fine indices, Greek symbols, and transition arrows.
+   - **Intelligent Diagram Segmentation**: Uses a `(17, 17)` morphological bridge kernel and `cv2.RETR_LIST` with border clearing to accurately detect, crop, and caption state diagrams, flowcharts, circuits, and illustrations (`documents/figures/`).
+   - **Automata & Mathematical Healing**: Automatically reconstructs automata state indices (`q₀`, `q₁`, `qₙ`), input/output symbols (`a₀`, `b₁`), Greek mappings ($\delta$, $\lambda$), and transition arrows (`→`).
+   - **Table Extraction & Safeguards**: Recovers 2D table matrices while strictly preventing diagrams or captions from being misclassified as tables.
+   - Ideal for standard reports, textbooks, technical diagrams, printed invoices, receipts, and confidentiality-restricted documents.
 
 2. **🌟 Smart AI Mode (Multimodal Vision)**:
    - Powered by Google Gemini multimodal vision AI through a high-availability model fallback pool (`gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.6-flash`, `gemini-3.8-flash`).
@@ -50,11 +54,12 @@ LiveDoc features a versatile tri-mode processing engine that balances speed, pri
 
 ```mermaid
 flowchart TD
-    subgraph S1["1. Real-Time Camera & Positioning"]
-        CAM["Live Video Stream\n(Webcam / 1080p Mobile Cam)"] --> QC{"Quality Assessment"}
+    subgraph S1["1. Real-Time Camera & File Ingestion"]
+        CAM["Live Video Stream\n(Webcam / Mobile Cam)"] --> QC{"Quality Assessment"}
+        UPL["📂 Image File Upload\n(JPG, PNG, TIFF, WEBP, JFIF)"] --> DET["4-Point Contour Lock & Perspective Warp"]
         QC -->|"Blur (Var < 20)"| BLUR["[!] Hold Steady — Focus Incomplete"]
         QC -->|"Glare (> 8%)"| GLARE["[!] Glare Detected — Adjust Angle"]
-        QC -->|"Sharp & Centered"| DET["4-Point Contour Lock & Perspective Warp"]
+        QC -->|"Sharp & Centered"| DET
     end
 
     subgraph S2["2. Processing Mode Routing"]
@@ -72,8 +77,8 @@ flowchart TD
 
     subgraph S4["4. Extraction & Reconstruction"]
         LOCAL_PATH --> CV_DEC["Layout Decomposition\n(Tables, Figures, Headings, Text)"]
-        CV_DEC --> OCR_ENG["PaddleOCR Token & Line Clustering"]
-        OCR_ENG --> TBL_REC["2D Table Matrix & Typography Normalizer"]
+        CV_DEC --> OCR_ENG["PaddleOCR Token & Line Clustering\n(Limit=1600, Box=0.30, Unclip=1.7)"]
+        OCR_ENG --> TBL_REC["2D Table Matrix & Typography Normalizer\n(Automata Healing, Diagram Token Suppression)"]
 
         AI_PATH --> GEMINI_POOL["High-Availability Model Pool\n(gemini-3.5-flash / lite / 3.6 / 3.8)"]
         GEMINI_POOL --> FIG_CROP["Dynamic Figure Bounding-Box Grounding & Cropping"]
@@ -81,12 +86,12 @@ flowchart TD
     end
 
     subgraph S5["5. Output & Publication Export"]
-        TBL_REC --> DOC_VIEW["Interactive Multi-Tab Viewer\n(Formatted HTML, Markdown, JSON, Validation)"]
+        TBL_REC --> DOC_VIEW["Interactive 5-Tab Viewer\n(Visual 2D Layout, Formatted HTML, Markdown, JSON, Validation)"]
         FIG_CROP --> DOC_VIEW
         LATEX_GEN --> DOC_VIEW
-        DOC_VIEW --> PDF_EXP["Intelligent Auto-Fit PDF Exporter\n(Proportional Sizing, Font Scaling, LaTeX Typography)"]
-        PDF_EXP --> OUT_PDF["Publication-Grade A4 PDF"]
-        DOC_VIEW --> OUT_FILES["Export .MD / .HTML / .JSON"]
+        DOC_VIEW --> PDF_EXP["Pure Digital Vector PDF Reconstructor\n(1-to-1 Physical Positioning, Zero Photo Background, Aspect-Preserved Figures)"]
+        PDF_EXP --> OUT_PDF["Publication-Grade Vector PDF"]
+        DOC_VIEW --> OUT_FILES["Export .MD / .HTML / .JSON / .TXT"]
     end
 ```
 
@@ -222,12 +227,14 @@ LiveDoc/
 │   ├── camera_manager.py       # Threaded multi-resolution camera ingestion
 │   ├── document_detector.py    # Edge detection, quality checks & perspective warp
 │   ├── layout_analyzer.py      # Bounding box layout decomposition
-│   ├── ocr_engine.py           # PaddleOCR extraction, outline hierarchy & noise filters
+│   ├── ocr_engine.py           # PaddleOCR extraction, diagram segmentation & automata healing
+│   ├── layout_renderer.py      # Unified 2D visual layout & digital vector PDF renderer
+│   ├── text_markup.py          # Typography sanitizer, LaTeX entity converter & symbol scrubber
 │   ├── smart_ai_engine.py      # Google Gemini multimodal vision AI with fallback pool
 │   ├── table_extractor.py      # Matrix cell clustering & table reconstruction
 │   ├── validator.py            # Confidence auditing & intelligent auto escalation
-│   ├── pdf_exporter.py         # LaTeX typography, proportional sizing & PDF generation
-│   └── gui.py                  # PyQt6 dark-themed graphical interface
+│   ├── pdf_exporter.py         # Digital vector PDF reconstruction & physical coordinate mapping
+│   └── gui.py                  # PyQt6 dark-themed interface + Image Upload & 5-tab preview
 ├── documents/
 │   └── figures/                # Grounded, high-resolution diagram & figure crops
 └── models/                     # Custom trained YOLO weights (gitignored)
@@ -306,22 +313,23 @@ python main.py
 
 ## Usage Guide
 
-1. **Select Camera**: Choose your webcam or connected phone camera from the dropdown in the bottom toolbar.
+1. **Document Ingestion (Camera or Image Upload)**:
+   - **Live Camera**: Choose your webcam or connected phone camera from the dropdown in the toolbar. Place your document within view until the green boundary locks. Click **Scan Document**.
+   - **Image File Upload**: Click the purple **📂 Upload Image** button in the toolbar. Select any `.jpg`, `.jpeg`, `.png`, `.bmp`, `.tiff`, `.webp`, or `.jfif` file. LiveDoc immediately displays the preview badge and automatically executes full digitization into all output tabs.
 2. **Choose Mode**:
    - **Auto (Hybrid)** *(Recommended)*: Fast offline scan that automatically enhances complex layouts with Smart AI.
    - **Smart AI (Gemini)**: Full multimodal vision digitization for publication-grade output with LaTeX equations.
-   - **Local (Offline)**: 100% offline, zero-network processing.
+   - **Local (Offline)**: 100% offline, zero-network processing with intelligent diagram segmentation and automata healing.
 3. **Configure Gemini API Key** *(Optional, for Smart AI / Auto)*:
    - Click **⚙️ AI Settings** in the toolbar.
    - Enter your free Gemini API key from [Google AI Studio](https://aistudio.google.com).
    - Click **Test Connection** $\rightarrow$ **Save API Key**.
-4. **Align Document**: Place your document within view. The live feed displays a green boundary overlay when the document is locked and steady.
-5. **Scan Document**: Click **Scan Document**. The digitized document will appear immediately in the right pane.
-6. **Review Tabs**:
-   - **Formatted Document**: Rich visual HTML preview with rendered tables, diagrams, and typography.
-   - **Markdown / Plain Text**: Clean GitHub-Flavored Markdown with standard LaTeX notation.
-   - **Structured JSON**: Machine-readable tokens, coordinates, and bounding boxes.
+4. **Interactive 5-Tab Review**:
+   - **Visual 2D Layout**: Interactive vector-rendered page matching the exact physical layout with proportional diagrams, centered tables, and clean typography.
+   - **Formatted Document**: Rich visual HTML preview with rendered tables, diagrams, and styled typography.
+   - **Markdown / Plain Text**: Clean GitHub-Flavored Markdown with standard LaTeX math.
+   - **Structured JSON**: Machine-readable tokens, coordinates, bounding boxes, and hierarchy.
    - **Validation Report**: Real-time confidence score (OCR, Lexical, Table, Layout) and arithmetic auditing.
-7. **Export**:
-   - Click **📄 Save as PDF** to export an auto-fitted, publication-grade PDF.
-   - Click **Export Document...** to save as `.md`, `.html`, or `.json`.
+5. **Export**:
+   - Click **📄 Save as PDF** to export a pure digital vector PDF (with 1-to-1 physical positioning, zero scanned photo background, and aspect-preserved figures).
+   - Click **Export Document...** to save as `.md`, `.html`, `.json`, or `.txt`.

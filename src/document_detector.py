@@ -282,6 +282,8 @@ class DocumentDetector:
         image = self.deskew_document(image)
 
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-        norm = cv2.normalize(gray, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8UC1)
+        clahe = cv2.createCLAHE(clipLimit=1.6, tileGridSize=(8, 8))
+        enhanced_gray = clahe.apply(gray)
+        norm = cv2.normalize(enhanced_gray, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8UC1)
         enhanced = cv2.cvtColor(norm, cv2.COLOR_GRAY2BGR)
         return enhanced

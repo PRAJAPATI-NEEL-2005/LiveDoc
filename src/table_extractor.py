@@ -27,6 +27,40 @@ class TableExtractor:
         t = re.sub(r"^([A-Za-z\~\^\v\-]{1,6})\s+\d{1,2}$", r"\1", t)
         return t
 
+    @staticmethod
+    def _repair_boolean_table(headers: List[str], rows: List[List[str]]):
+        """
+        Truth-table cleanup, only applied when most body cells are T/F/0/1:
+        - strips stray dots / specks / a fused 'X' around a value ('.T', 'T.', 'XF' -> 'T', 'T', 'F')
+        - restores logic operators in headers ('A^B' -> 'A∧B', 'AvB' -> 'A∨B', '1S' -> '¬S')
+        """
+        vals = [c.strip().upper() for r in rows for c in r if c.strip()]
+        if len(vals) < 4:
+            return headers, rows
+        pat = re.compile(r"^[^A-Za-z0-9]*[xX]?\s*([TFtf01])[^A-Za-z0-9]*$")
+        boolish = sum(1 for v in vals if pat.match(v))
+        if boolish / float(len(vals)) < 0.70:
+            return headers, rows
+
+        def fix_cell(c):
+            m = pat.match(c.strip())
+            return m.group(1).upper() if m else c
+
+        def fix_header(h):
+            h = h.strip()
+            m = re.match(r"^[1lI\]\|!~]\s*([A-Za-z])$", h)
+            if m:
+                return "¬" + m.group(1).upper()
+            m = re.match(r"^([A-Z])\s*\^\s*([A-Z])$", h)
+            if m:
+                return f"{m.group(1)}∧{m.group(2)}"
+            m = re.match(r"^([A-Z])\s*[vV]\s*([A-Z])$", h)
+            if m:
+                return f"{m.group(1)}∨{m.group(2)}"
+            return h
+
+        return [fix_header(h) for h in headers], [[fix_cell(c) for c in r] for r in rows]
+
     @classmethod
     def extract_table(cls, crop_img: np.ndarray, tokens: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -193,6 +227,8 @@ class TableExtractor:
         clean_rows = []
         for r in data_rows:
             clean_rows.append([cls._clean_cell(c.replace("|", "│")).strip() for c in r])
+
+        clean_headers, clean_rows = cls._repair_boolean_table(clean_headers, clean_rows)
 
         # 4. Generate Centered Markdown Table
         md_lines = []

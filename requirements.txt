@@ -4,3 +4,4 @@ paddlepaddle==2.6.2
 paddleocr<=2.8.1
 PyQt6
 numpy<2
+pymupdf

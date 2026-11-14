@@ -293,7 +293,13 @@ Multi-page PDF export with automatic page breaks and clean typography.
             pdf_doc.load(test_pdf_path)
             pages = pdf_doc.pageCount()
             pdf_doc.close()
-            os.remove(test_pdf_path)
+            del pdf_doc
+            import gc
+            gc.collect()
+            try:
+                os.remove(test_pdf_path)
+            except Exception:
+                pass
             report("markdown_to_pdf() generates valid multi-page PDF", True, f"Output pages: {pages}")
         else:
             report("markdown_to_pdf() generates valid multi-page PDF", False, "File generation failed")
