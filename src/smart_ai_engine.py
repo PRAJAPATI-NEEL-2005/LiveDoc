@@ -127,7 +127,7 @@ class SmartAIEngine:
             "   - Use # for the main document title or running header at the top.\n"
             "   - Use ## for main section titles (e.g. ## 2.1 Section Name).\n"
             "   - Use ### for subheadings.\n"
-            "   - Format running header text naturally (e.g. # Theory of Computation — Review of Mathematical Theory). Do NOT output horizontal spacing macros like \\qquad or raw page numbers in the title.\n"
+            "   - Format running header text naturally (e.g. # Document Title — Section or Subtitle). Do NOT output horizontal spacing macros like \\qquad or raw page numbers in the title.\n"
             "2. Flowing Paragraphs:\n"
             "   - Combine lines that belong to the same paragraph into a continuous flowing paragraph. Do NOT prematurely break lines within a sentence.\n"
             "   - Preserve bullet points and numbered list items on their own lines (e.g. * item, 1., 2., i), ii), etc.).\n"

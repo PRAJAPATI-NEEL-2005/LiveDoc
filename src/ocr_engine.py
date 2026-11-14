@@ -433,30 +433,7 @@ class OCREngine:
         # ── 1. Remove unprintable / control characters ──────────────────
         t = re.sub(r"[\ufffd\x00-\x08\x0b\x0c\x0e-\x1f]", "", t)
 
-        # ── 2. Common single-character OCR misreads ──────────────────────
-        # Leading noise dot before a capital letter/digit in a table cell
-        # e.g. ".T" -> "T",  ".F" -> "F",  ".1" -> "1"
-        t = re.sub(r"^\s*\.([TF01])", r"\1", t)
-        t = re.sub(r"(?<=\s)\.([TF01])\b", r"\1", t)
-
-        # Stray 'X' or 'x' fused before a truth-table value e.g. "XF" -> "F", "xT" -> "T"
-        t = re.sub(r"\bX([TF])\b", r"\1", t)
-        t = re.sub(r"\bx([TF])\b", r"\1", t)
-
-        # OCR misreads '1' or 'l' as negation prefix before uppercase S, P, Q
-        # e.g. "1s" or "1S" when the original was ¬S
-        t = re.sub(r"\b1([SPQR])\b", r"\1", t)
-        t = re.sub(r"\bl([SPQR])\b",  r"\1", t)
-
-        # Missing space inside parenthesised section labels
-        # e.g. "(AND)" OCR'd as "AND)" — restore opening bracket
-        t = re.sub(r"(?<![\(\[])\b(AND|OR|NOT|XOR|NAND|NOR|XNOR)\)", r"(\1)", t)
-
-        # Logic operators between single capital letters: 'A^B' -> 'A∧B', 'AvB' -> 'A∨B'
-        t = re.sub(r"\b([A-Z])\^([A-Z])\b", r"\1∧\2", t)
-        t = re.sub(r"\b([A-Z])v([A-Z])\b", r"\1∨\2", t)
-
-        # ── 3. Spacing normalisations ────────────────────────────────────
+        # ── 2. Spacing normalisations ────────────────────────────────────
         t = re.sub(r"[ \t]+", " ", t)
         t = re.sub(r"([,;:?!])([A-Za-z0-9])", r"\1 \2", t)
         t = re.sub(r"(\.)([ ]*[A-Za-z])", r". \2", t)
@@ -465,8 +442,9 @@ class OCREngine:
         t = re.sub(r"\)([a-zA-Z])", r") \1", t)
         t = re.sub(r"\s+([,.:;?!])", r"\1", t)
         t = re.sub(r"^\)\s*", "", t)
+        t = re.sub(r"([a-z])\.([A-Z])", r"\1. \2", t)
 
-        # ── 4. Roman numeral / section label separation ──────────────────
+        # ── 3. Outline / numbered list item spacing ─────────────────────
         def _sep_roman(m):
             prefix, roman, word = m.group(1), m.group(2), m.group(3)
             if roman in ("i", "j") and word.startswith("R"):
@@ -477,47 +455,16 @@ class OCREngine:
         t = re.sub(r"(^|\s)([ivxlcdm]{1,5})\s*([A-Z][a-z]+)", _sep_roman, t)
         t = re.sub(r"(^|\s)(\d{1,2})([A-Z][a-z]+)", r"\1\2. \3", t)
 
-        # ── 5. Math operator spacing & logic symbol cleanup ──────────────
+        # ── 4. General operator & relation spacing ───────────────────────
         t = re.sub(r"([A-Za-z0-9])(=)([A-Za-z0-9])", r"\1 \2 \3", t)
-        t = re.sub(r"(?<=\w)\s*&&\s*(?=\w)", " ∧ ", t)
-        t = re.sub(r"\s*&&\s*", " ∧ ", t)
         t = re.sub(r"\s*->\s*", " → ", t)
         t = re.sub(r"\s*<-\s*", " ← ", t)
         t = re.sub(r"\s*=>\s*", " ⇒ ", t)
 
-        # ── 6. Automata & Mathematical notation healing ─────────────────
-        t = re.sub(r"\b([qQ])0\b", r"\1₀", t)
-        t = re.sub(r"\b([qQ])1\b", r"\1₁", t)
-        t = re.sub(r"\b([qQ])2\b", r"\1₂", t)
-        t = re.sub(r"\b([qQ])3\b", r"\1₃", t)
-        t = re.sub(r"\b([qQ])n\b", r"\1ₙ", t)
-        t = re.sub(r"\b([ab])0\b", r"\1₀", t)
-        t = re.sub(r"\b([ab])1\b", r"\1₁", t)
-        t = re.sub(r"\b([ab])2\b", r"\1₂", t)
-        t = re.sub(r"\b([ab])3\b", r"\1₃", t)
-        t = re.sub(r"\b([ab])n\b", r"\1ₙ", t)
-        t = re.sub(r"\b([qQ])o\b", r"\1₀", t)
-        t = re.sub(r"\b([qQ])obe\b", r"\1₀, b", t)
-        t = re.sub(r"\b8\s*\[q", r"δ([q", t)
-        t = re.sub(r"\b8\s*\(", r"δ(", t)
-        t = re.sub(r"\b8\b(?=\s+defines the move)", r"δ", t)
-        t = re.sub(r"\b1\s*\[q", r"λ([q", t)
-        t = re.sub(r"\b1\s*\(", r"λ(", t)
-        t = re.sub(r"\b1\b(?=\s+defines the output)", r"λ", t)
-
-        # Common printed English OCR slips
-        t = re.sub(r"\bfollwing\b", "following", t)
-        t = re.sub(r"\bino\b(?=\s+[a-z])", "into", t)
-        t = re.sub(r"\bequialent\b", "equivalent", t)
-        t = re.sub(r"\bmachin\b", "machine", t)
-        t = re.sub(r"\butput\b", "output", t)
-        t = re.sub(r"\bequence\b", "sequence", t)
-        t = re.sub(r"([a-z])\.([A-Z])", r"\1. \2", t)
-
         # Strip accidental markdown symbols leaking into OCR
         t = t.replace("**", "").replace("__", "").replace("~~", "").replace("`", "")
 
-        # ── 7. Final whitespace trim ─────────────────────────────────────
+        # ── 5. Final whitespace trim ─────────────────────────────────────
         return t.strip()
 
     def extract_structured_document(self, image: np.ndarray, layout_boxes: List[Dict[str, Any]] = None) -> Dict[str, Any]:
