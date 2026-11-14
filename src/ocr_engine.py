@@ -356,44 +356,60 @@ class OCREngine:
     @staticmethod
     def _clean_text_spacing(text: str) -> str:
         """
-        General typographic spacing and whitespace normalization for any document:
-        - Collapses duplicate spaces.
-        - Fixes spacing around punctuation (commas, periods, colons).
-        - Separates outline headings and list item numbers.
-        - Cleans unprintable non-ASCII corruptions while preserving text integrity.
+        General typographic spacing, whitespace normalisation, and OCR
+        artifact removal for any printed document.
         """
         if not text:
             return ""
         t = text
-        # Remove unprintable/control characters and unicode replacement artifacts
+
+        # ── 1. Remove unprintable / control characters ──────────────────
         t = re.sub(r"[\ufffd\x00-\x08\x0b\x0c\x0e-\x1f]", "", t)
-        # Collapse multiple whitespace characters into single space
+
+        # ── 2. Common single-character OCR misreads ──────────────────────
+        # Leading noise dot before a capital letter/digit in a table cell
+        # e.g. ".T" -> "T",  ".F" -> "F",  ".1" -> "1"
+        t = re.sub(r"^\s*\.([TF01])", r"\1", t)
+        t = re.sub(r"(?<=\s)\.([TF01])\b", r"\1", t)
+
+        # Stray 'X' or 'x' fused before a truth-table value e.g. "XF" -> "F", "xT" -> "T"
+        t = re.sub(r"\bX([TF])\b", r"\1", t)
+        t = re.sub(r"\bx([TF])\b", r"\1", t)
+
+        # OCR misreads '1' or 'l' as negation prefix before uppercase S, P, Q
+        # e.g. "1s" or "1S" when the original was ¬S
+        t = re.sub(r"\b1([SPQR])\b", r"\1", t)
+        t = re.sub(r"\bl([SPQR])\b",  r"\1", t)
+
+        # Missing space inside parenthesised section labels
+        # e.g. "(AND)" OCR'd as "AND)" — restore opening bracket
+        t = re.sub(r"(?<![\(\[])\b(AND|OR|NOT|XOR|NAND|NOR|XNOR)\)", r"(\1)", t)
+
+        # ── 3. Spacing normalisations ────────────────────────────────────
         t = re.sub(r"[ \t]+", " ", t)
-        # Ensure single space after punctuation when followed by a word character
         t = re.sub(r"([,;:?!])([A-Za-z0-9])", r"\1 \2", t)
-        t = re.sub(r"(\.)([A-Za-z])", r"\1 \2", t)
-        # Separate fused words in camelCase or parentheses
+        t = re.sub(r"(\.)([ ]*[A-Za-z])", r". \2", t)
         t = re.sub(r"([a-z]{2,})([A-Z][a-z]{2,})", r"\1 \2", t)
         t = re.sub(r"([a-zA-Z0-9])\(", r"\1 (", t)
         t = re.sub(r"\)([a-zA-Z])", r") \1", t)
-        # Remove stray space immediately before punctuation
         t = re.sub(r"\s+([,.:;?!])", r"\1", t)
-        # Strip stray leading closing parenthesis/bracket e.g. ') Conjunction' -> 'Conjunction'
         t = re.sub(r"^\)\s*", "", t)
-        # Separate roman numerals or letters merged with uppercase words e.g. 'vIf and only if' -> 'v) If and only if'
+
+        # ── 4. Roman numeral / section label separation ──────────────────
         def _sep_roman(m):
             prefix, roman, word = m.group(1), m.group(2), m.group(3)
-            # Preserve mathematical relation variables like iRi, iRj, jRk, jRi
             if roman in ("i", "j") and word.startswith("R"):
                 return m.group(0)
             return f"{prefix}{roman}) {word}"
 
         t = re.sub(r"(^|\s)([ivxlcdm]{1,5})([A-Z][a-z]{1,})", _sep_roman, t)
         t = re.sub(r"(^|\s)([ivxlcdm]{1,5})\s*([A-Z][a-z]+)", _sep_roman, t)
-        # Separate digits glued directly to capitalized words e.g. '4Symmetric' -> '4. Symmetric'
         t = re.sub(r"(^|\s)(\d{1,2})([A-Z][a-z]+)", r"\1\2. \3", t)
-        # Space around math equality/operators when between alphanumeric tokens e.g. 'A=B' -> 'A = B'
+
+        # ── 5. Math operator spacing ─────────────────────────────────────
         t = re.sub(r"([A-Za-z0-9])(=)([A-Za-z0-9])", r"\1 \2 \3", t)
+
+        # ── 6. Final whitespace trim ─────────────────────────────────────
         return t.strip()
 
     def extract_structured_document(self, image: np.ndarray, layout_boxes: List[Dict[str, Any]] = None) -> Dict[str, Any]:

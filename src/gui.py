@@ -967,105 +967,110 @@ class LiveDocApp(QMainWindow):
 
     def _render_annotated_document(self, flat_img: np.ndarray, elements: list, tokens: list):
         """
-        Renders a 100% clean white digital reconstructed document:
-        - Pure white digital background (zero camera noise, dark shadows, or photo artifacts).
-        - Clean digital typography (Title, Headings, Paragraphs) placed at exact 2D coordinates.
-        - Real digital vector tables with crisp borders and clean cell contents.
-        - Cropped diagram/figure images placed into their detected bounding boxes.
+        Renders the actual scanned document image with coloured element overlays:
+        - Real document photo as background (brightened for clarity)
+        - Semi-transparent coloured region per element type
+        - Solid border + label badge showing Title / Heading / Paragraph / Table / Image
+        - Table grid drawn inside detected table regions
         """
         try:
-            H, W = flat_img.shape[:2] if flat_img is not None else (1200, 800)
-            # 1. Pure clean white digital canvas (NOT the camera photo)
-            canvas = np.ones((H, W, 3), dtype=np.uint8) * 255
+            if flat_img is None or flat_img.size == 0:
+                return
+            H, W = flat_img.shape[:2]
 
-            # 2. Render digital elements at physical coordinates
+            # Base: actual document image, slightly brightened so overlays pop
+            canvas = cv2.convertScaleAbs(flat_img, alpha=0.80, beta=50)
+
+            # Colour scheme per element type  (BGR)
+            TYPE_STYLE = {
+                "Title":     {"box": (30,  100, 220), "fill": (200, 220, 255), "label": "TITLE"},
+                "Heading":   {"box": (20,  160,  60), "fill": (200, 255, 210), "label": "HEADING"},
+                "Paragraph": {"box": (160,  60,  20), "fill": (220, 200, 255), "label": "PARA"},
+                "Table":     {"box": (40,  160, 200), "fill": (220, 250, 255), "label": "TABLE"},
+                "Image":     {"box": (40,  200, 100), "fill": (220, 255, 220), "label": "IMAGE"},
+            }
+
             for el in elements:
-                el_type = el.get("type", "Paragraph")
                 box = el.get("box")
                 if not box or len(box) < 4:
                     continue
                 x1, y1, x2, y2 = map(int, box[:4])
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(W - 1, x2), min(H - 1, y2)
+                if x2 <= x1 + 2 or y2 <= y1 + 2:
+                    continue
 
-                if el_type == "Title":
-                    t_text = el.get("text") or el.get("content", "")
-                    cv2.putText(canvas, t_text[:55], (x1 + 8, y1 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (140, 50, 10), 2, cv2.LINE_AA)
-                    cv2.line(canvas, (x1, y2), (x2, y2), (200, 120, 20), 2)
+                el_type = el.get("type", "Paragraph")
+                style   = TYPE_STYLE.get(el_type, TYPE_STYLE["Paragraph"])
+                bcol    = style["box"]
+                fcol    = style["fill"]
+                label   = style["label"]
 
-                elif el_type == "Heading":
-                    h_text = el.get("text") or el.get("content", "")
-                    cv2.putText(canvas, h_text[:65], (x1, y1 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.70, (160, 70, 20), 2, cv2.LINE_AA)
+                # Semi-transparent fill
+                overlay = canvas.copy()
+                cv2.rectangle(overlay, (x1, y1), (x2, y2), fcol, -1)
+                cv2.addWeighted(overlay, 0.22, canvas, 0.78, 0, canvas)
 
-                elif el_type == "Table":
-                    # Clean digital table grid
+                # Solid border
+                thick = 2 if el_type in ("Title", "Table") else 1
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), bcol, thick)
+
+                # Label badge (small filled rect + white text)
+                badge_w = len(label) * 7 + 8
+                bx2 = min(W - 1, x1 + badge_w)
+                by2 = min(H - 1, y1 + 15)
+                cv2.rectangle(canvas, (x1, y1), (bx2, by2), bcol, -1)
+                cv2.putText(canvas, label, (x1 + 3, y1 + 11),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.36, (255, 255, 255), 1, cv2.LINE_AA)
+
+                # Table grid inside the detected region
+                if el_type == "Table":
                     headers = el.get("headers", [])
-                    rows = el.get("rows", [])
-                    num_r = len(rows) + 1
-                    rh = max(22, (y2 - y1) // max(1, num_r))
-                    # Header background fill & border
-                    cv2.rectangle(canvas, (x1, y1), (x2, min(y2, y1 + rh)), (240, 245, 250), -1)
-                    cv2.rectangle(canvas, (x1, y1), (x2, y2), (60, 70, 80), 2)
-                    cv2.line(canvas, (x1, min(y2, y1 + rh)), (x2, min(y2, y1 + rh)), (60, 70, 80), 2)
+                    rows    = el.get("rows", [])
+                    num_r   = len(rows) + 1
+                    rh = max(16, (y2 - y1) // max(1, num_r))
+                    hdr_y2  = min(y2, y1 + rh)
+                    cv2.rectangle(canvas, (x1, y1), (x2, hdr_y2), (200, 215, 230), -1)
+                    cv2.rectangle(canvas, (x1, y1), (x2, y2), bcol, 1)
+                    cv2.line(canvas, (x1, hdr_y2), (x2, hdr_y2), bcol, 1)
                     if headers:
-                        cw = max(30, (x2 - x1) // len(headers))
-                        for ci, ch in enumerate(headers):
+                        ncols = max(1, len(headers))
+                        cw = (x2 - x1) // ncols
+                        for ci, hdr in enumerate(headers):
                             cx = x1 + ci * cw
                             if ci > 0:
-                                cv2.line(canvas, (cx, y1), (cx, y2), (180, 190, 200), 1)
-                            cv2.putText(canvas, str(ch)[:14], (cx + 6, y1 + rh - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (20, 30, 40), 1, cv2.LINE_AA)
-                    for ri, row in enumerate(rows):
+                                cv2.line(canvas, (cx, y1), (cx, y2), bcol, 1)
+                            cv2.putText(canvas, str(hdr)[:14], (cx + 4, y1 + rh - 4),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.36, (10, 30, 60), 1, cv2.LINE_AA)
+                    for ri in range(len(rows)):
                         ry = y1 + (ri + 1) * rh
-                        if ry < y2:
-                            cv2.line(canvas, (x1, ry), (x2, ry), (210, 220, 230), 1)
-                            if headers:
-                                cw = max(30, (x2 - x1) // len(headers))
-                                for ci, cell in enumerate(row[:len(headers)]):
-                                    cx = x1 + ci * cw
-                                    cv2.putText(canvas, str(cell)[:16], (cx + 6, ry + rh - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (40, 50, 60), 1, cv2.LINE_AA)
+                        if ry >= y2:
+                            break
+                        cv2.line(canvas, (x1, ry), (x2, ry), (160, 180, 200), 1)
 
                 elif el_type in ("Image", "Figure", "Picture"):
+                    # Place actual figure crop if saved
                     fig_path = el.get("image_path")
                     if fig_path and os.path.exists(fig_path):
                         fig_crop = cv2.imread(fig_path)
-                        if fig_crop is not None:
-                            fw, fh = x2 - x1, y2 - y1
-                            if fw > 10 and fh > 10:
-                                canvas[y1:y2, x1:x2] = cv2.resize(fig_crop, (fw, fh))
-                    elif flat_img is not None:
-                        crop = flat_img[y1:y2, x1:x2]
-                        if crop.size > 0:
-                            canvas[y1:y2, x1:x2] = crop
-                    cv2.rectangle(canvas, (x1, y1), (x2, y2), (190, 200, 215), 1)
+                        if fig_crop is not None and (x2-x1) > 10 and (y2-y1) > 10:
+                            canvas[y1:y2, x1:x2] = cv2.resize(fig_crop, (x2-x1, y2-y1))
 
-                else:
-                    # Paragraph: wrap lines inside paragraph bounds
-                    p_text = el.get("text") or el.get("content", "")
-                    words = p_text.split()
-                    curr_line = ""
-                    curr_y = y1 + 16
-                    line_h = 18
-                    max_w = x2 - x1
-                    for w in words:
-                        test_line = (curr_line + " " + w).strip()
-                        (tw, _), _ = cv2.getTextSize(test_line, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-                        if tw > max_w and curr_line:
-                            if curr_y < y2 - 4:
-                                cv2.putText(canvas, curr_line, (x1, curr_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (25, 30, 40), 1, cv2.LINE_AA)
-                            curr_line = w
-                            curr_y += line_h
-                        else:
-                            curr_line = test_line
-                    if curr_line and curr_y < y2 - 2:
-                        cv2.putText(canvas, curr_line, (x1, curr_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (25, 30, 40), 1, cv2.LINE_AA)
+            # Legend (top-right corner)
+            leg_x, leg_y = W - 115, 8
+            for etype, st in TYPE_STYLE.items():
+                cv2.rectangle(canvas, (leg_x, leg_y), (leg_x + 12, leg_y + 12), st["box"], -1)
+                cv2.putText(canvas, etype, (leg_x + 16, leg_y + 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.33, st["box"], 1, cv2.LINE_AA)
+                leg_y += 18
 
-            # Resize to fit scroll area comfortably
+            # Resize to fit scroll area
             target_w = max(550, min(850, self.tab_visual_scroll.width() - 25))
-            scale = target_w / float(W)
+            scale    = target_w / float(W)
             target_h = max(100, int(H * scale))
-            resized = cv2.resize(canvas, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-            qimg = QImage(rgb.data, target_w, target_h, 3 * target_w, QImage.Format.Format_RGB888)
+            resized  = cv2.resize(canvas, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            rgb      = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+            qimg     = QImage(rgb.data, target_w, target_h, 3 * target_w, QImage.Format.Format_RGB888)
             self.tab_visual_label.setPixmap(QPixmap.fromImage(qimg))
             self.tab_visual_label.setText("")
         except Exception as e:
@@ -1211,23 +1216,19 @@ class LiveDocApp(QMainWindow):
             combined_md = "\n\n---\n\n".join(self.all_pages_markdown)
             title = self.latest_doc.get("title", "Digitized Document") if self.latest_doc else "Digitized Document"
 
-            # Export as clean digital PDF:
-            # - Pure white background (zero camera image)
-            # - Elements placed at their exact original page positions
-            # - Proper styles: blue titles/headings, styled tables, justified paragraphs
-            ok = PDFExporter.create_digital_reconstructed_pdf(
-                self.all_pages_data, path,
-                doc_title=title,
-                include_image_background=False
-            )
+            # Export as clean structured digital PDF:
+            # Properly typeset flowing document - headings bold & coloured,
+            # tables formatted, paragraphs justified, no camera image anywhere
+            ok = PDFExporter.markdown_to_pdf(combined_md, path, doc_title=title)
             if ok:
                 self.status_bar.showMessage(f"Digital PDF saved: {path}")
                 QMessageBox.information(
                     self, "PDF Saved",
-                    f"Successfully saved digital PDF to:\n{path}\n\n"
+                    f"Successfully saved structured digital PDF to:\n{path}\n\n"
                     "• Pure white background — zero camera image\n"
-                    "• Elements at exact original document positions\n"
-                    "• Titles in blue, headings styled, tables formatted\n"
+                    "• Properly structured: Title, Headings, Paragraphs, Tables\n"
+                    "• Headings in blue bold, body text justified\n"
+                    "• Tables with styled header rows and borders\n"
                     "• Searchable and copy-pasteable text"
                 )
             else:
@@ -1254,12 +1255,8 @@ class LiveDocApp(QMainWindow):
             if "*.pdf" in selected_filter or path.lower().endswith(".pdf"):
                 if not path.lower().endswith(".pdf"):
                     path += ".pdf"
-                # Export clean digital PDF with exact element positions, no camera image
-                ok = PDFExporter.create_digital_reconstructed_pdf(
-                    self.all_pages_data, path,
-                    doc_title=title,
-                    include_image_background=False
-                )
+                # Clean structured typeset PDF - no camera image
+                ok = PDFExporter.markdown_to_pdf(combined_md, path, doc_title=title)
                 if not ok:
                     raise RuntimeError("Failed to generate PDF.")
             elif "*.json" in selected_filter or path.lower().endswith(".json"):
