@@ -26,12 +26,12 @@ import cv2
 import numpy as np
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
-    QTextEdit, QTextBrowser, QHBoxLayout, QVBoxLayout, QSplitter,
+    QTextEdit, QTextBrowser, QHBoxLayout, QVBoxLayout, QBoxLayout, QSplitter,
     QStatusBar, QProgressBar, QFrame, QSizePolicy, QComboBox,
     QTabWidget, QFileDialog, QMessageBox, QDialog, QLineEdit, QCheckBox, QScrollArea
 )
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize
-from PyQt6.QtGui import QImage, QPixmap, QFont, QColor, QPalette, QIcon
+from PyQt6.QtGui import QImage, QPixmap, QFont, QColor, QPalette, QIcon, QShortcut, QKeySequence
 
 # Import backend modules
 from src.camera_manager import LiveCameraManager
@@ -41,51 +41,23 @@ from src.ocr_engine import OCREngine
 from src.smart_ai_engine import SmartAIEngine
 from src.pdf_exporter import PDFExporter
 from src.layout_renderer import render_page_pixmap, export_pdf as export_layout_pdf
+from src import theme
+from src.ui_widgets import FlowLayout, ElidedLabel
 
 
 # ─────────────────────────────────────────────────────────
 # AI Settings & API Configuration Dialog
 # ─────────────────────────────────────────────────────────
 class AISettingsDialog(QDialog):
-    def __init__(self, smart_ai_engine: SmartAIEngine, parent=None):
+    def __init__(self, smart_ai_engine: SmartAIEngine, parent=None, theme_name: str = theme.DARK):
         super().__init__(parent)
         self.smart_ai_engine = smart_ai_engine
+        self.theme_name = theme_name
         self.setWindowTitle("LiveDoc AI Settings & API Configuration")
-        self.setMinimumWidth(540)
-        self.setStyleSheet("""
-            QDialog {
-                background-color: #0d1117;
-                color: #e2e8f0;
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
-            }
-            QLabel {
-                color: #e2e8f0;
-                font-size: 13px;
-            }
-            QLineEdit {
-                background-color: #161b22;
-                border: 1px solid #30363d;
-                border-radius: 6px;
-                color: #e2e8f0;
-                padding: 8px 12px;
-                font-family: monospace;
-                font-size: 13px;
-            }
-            QLineEdit:focus {
-                border-color: #38bdf8;
-            }
-            QPushButton {
-                border-radius: 6px;
-                padding: 8px 16px;
-                font-size: 13px;
-                font-weight: 600;
-            }
-            QCheckBox {
-                color: #94a3b8;
-                font-size: 12px;
-            }
-        """)
+        self.setMinimumWidth(340)
+        self.setStyleSheet(theme.build_dialog_stylesheet(theme_name))
         self._build_ui()
+        self.resize(540, self.sizeHint().height())
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -93,7 +65,8 @@ class AISettingsDialog(QDialog):
         layout.setContentsMargins(20, 20, 20, 20)
 
         title = QLabel("Google Gemini Vision AI Settings")
-        title.setStyleSheet("font-size: 16px; font-weight: bold; color: #38bdf8;")
+        title.setObjectName("dlg_title")
+        title.setWordWrap(True)
         layout.addWidget(title)
 
         desc = QLabel(
@@ -101,12 +74,12 @@ class AISettingsDialog(QDialog):
             "and automatically enhance low-confidence scans in 'Auto / Hybrid' mode."
         )
         desc.setWordWrap(True)
-        desc.setStyleSheet("color: #94a3b8; font-size: 12px;")
+        desc.setObjectName("dlg_muted")
         layout.addWidget(desc)
 
         # API Key Form
         key_label = QLabel("Gemini API Key:")
-        key_label.setStyleSheet("font-weight: bold; color: #cbd5e1;")
+        key_label.setObjectName("dlg_label")
         layout.addWidget(key_label)
 
         self.key_input = QLineEdit()
@@ -124,23 +97,23 @@ class AISettingsDialog(QDialog):
         )
         layout.addWidget(self.chk_show)
 
-        status_txt = "Status: API Key configured ✓" if self.smart_ai_engine.is_available() else "Status: No API key configured ⚠️"
-        status_col = "#6ee7b7" if self.smart_ai_engine.is_available() else "#fca5a5"
-        self.lbl_status = QLabel(status_txt)
-        self.lbl_status.setStyleSheet(f"color: {status_col}; font-weight: bold; font-size: 12px;")
+        self.lbl_status = QLabel()
+        self.lbl_status.setWordWrap(True)
+        self._set_status(self.smart_ai_engine.is_available())
         layout.addWidget(self.lbl_status)
 
         # Instructions / Free tier banner
         info_box = QFrame()
-        info_box.setStyleSheet("background-color: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 10px;")
+        info_box.setObjectName("dlg_info")
         info_layout = QVBoxLayout(info_box)
         info_layout.setContentsMargins(10, 8, 10, 8)
+        pal = theme.PALETTES[self.theme_name]
         info_text = QLabel(
             "<b>How to get your free Gemini API key:</b><br>"
-            "1. Visit <a href='https://aistudio.google.com' style='color: #38bdf8;'>https://aistudio.google.com</a><br>"
+            f"1. Visit <a href='https://aistudio.google.com' style='color: {pal['accent']};'>https://aistudio.google.com</a><br>"
             "2. Click <b>'Get API Key'</b> and create a new key.<br>"
             "3. Paste your key above and click <b>'Save Key'</b>.<br>"
-            "<small style='color: #94a3b8;'>• Generous free tier included. Stored safely in ~/.livedoc_config.json.</small>"
+            f"<small style='color: {pal['text_muted']};'>• Generous free tier included. Stored safely in ~/.livedoc_config.json.</small>"
         )
         info_text.setOpenExternalLinks(True)
         info_text.setWordWrap(True)
@@ -150,11 +123,10 @@ class AISettingsDialog(QDialog):
         # Buttons
         btn_box = QHBoxLayout()
         self.btn_save = QPushButton("Save Key")
-        self.btn_save.setStyleSheet("background-color: #0284c7; color: #fff;")
+        self.btn_save.setObjectName("dlg_primary")
         self.btn_save.clicked.connect(self._save_key)
 
         self.btn_close = QPushButton("Close")
-        self.btn_close.setStyleSheet("background-color: #21262d; color: #c9d1d9; border: 1px solid #30363d;")
         self.btn_close.clicked.connect(self.accept)
 
         btn_box.addStretch()
@@ -162,16 +134,24 @@ class AISettingsDialog(QDialog):
         btn_box.addWidget(self.btn_close)
         layout.addLayout(btn_box)
 
+    def _set_status(self, configured: bool):
+        if configured:
+            self.lbl_status.setText("Status: API Key configured ✓")
+            self.lbl_status.setObjectName("dlg_status_ok")
+        else:
+            self.lbl_status.setText("Status: No API key configured ⚠️")
+            self.lbl_status.setObjectName("dlg_status_err")
+        self.lbl_status.style().unpolish(self.lbl_status)
+        self.lbl_status.style().polish(self.lbl_status)
+
     def _save_key(self):
         new_key = self.key_input.text().strip()
         self.smart_ai_engine.save_api_key(new_key)
         if self.smart_ai_engine.is_available():
-            self.lbl_status.setText("Status: API Key configured ✓")
-            self.lbl_status.setStyleSheet("color: #6ee7b7; font-weight: bold; font-size: 12px;")
+            self._set_status(True)
             QMessageBox.information(self, "API Key Saved", "Gemini API key saved successfully!")
         else:
-            self.lbl_status.setText("Status: No API key configured ⚠️")
-            self.lbl_status.setStyleSheet("color: #fca5a5; font-weight: bold; font-size: 12px;")
+            self._set_status(False)
             QMessageBox.warning(self, "API Key Cleared", "The API key was cleared.")
 
 
@@ -284,7 +264,11 @@ class LiveDocApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("LiveDoc — Real-Time Intelligent Document Digitizer")
-        self.setMinimumSize(1320, 820)
+        self.setMinimumSize(520, 520)
+        self._set_initial_size()
+
+        # Theme (persisted between sessions)
+        self.theme_name = theme.load_saved_theme()
 
         # Backend objects
         self.camera = LiveCameraManager(camera_index=None)
@@ -307,230 +291,29 @@ class LiveDocApp(QMainWindow):
         # Digitized history
         self.latest_doc = None
         self.all_pages_markdown = []
-        self.all_pages_html = []
+        self.all_pages_html = []          # [(page_num, html_source, raw_html)]
         self.all_pages_elements = []
         self.all_pages_data = []
+
+        # Uploaded-image preview (re-scaled when the window is resized)
+        self._preview_frame = None
+        self._preview_name = ""
+        self._visual_page_args = None
+
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.timeout.connect(self._on_resize_settled)
 
         self._apply_stylesheet()
         self._build_ui()
         self._setup_camera_timer()
+        self._update_theme_button()
+        QShortcut(QKeySequence("Ctrl+T"), self, activated=self._toggle_theme)
+        self._update_responsive_layout()
 
     # ── Stylesheet ────────────────────────────────────────
     def _apply_stylesheet(self):
-        self.setStyleSheet("""
-            QMainWindow, QWidget {
-                background-color: #0d1117;
-                color: #e2e8f0;
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
-                font-size: 13px;
-            }
-            QLabel#title_label {
-                font-size: 22px;
-                font-weight: 800;
-                color: #38bdf8;
-                padding: 4px 0px;
-            }
-            QLabel#subtitle_label {
-                font-size: 12px;
-                color: #94a3b8;
-                padding-bottom: 6px;
-            }
-            QLabel#cam_feed {
-                background-color: #161b22;
-                border: 2px solid #30363d;
-                border-radius: 12px;
-            }
-            QLabel#section_header {
-                font-size: 12px;
-                font-weight: bold;
-                color: #94a3b8;
-                letter-spacing: 1px;
-                padding: 4px 0px;
-            }
-            QTabWidget::pane {
-                border: 2px solid #30363d;
-                border-radius: 8px;
-                background-color: #161b22;
-            }
-            QTabBar::tab {
-                background: #0d1117;
-                color: #94a3b8;
-                font-weight: bold;
-                padding: 8px 16px;
-                border-top-left-radius: 6px;
-                border-top-right-radius: 6px;
-                margin-right: 4px;
-            }
-            QTabBar::tab:selected {
-                background: #161b22;
-                color: #38bdf8;
-                border-bottom: 2px solid #38bdf8;
-            }
-            QTabBar::tab:hover {
-                color: #e2e8f0;
-            }
-            QTextEdit, QTextBrowser {
-                background-color: #161b22;
-                border: none;
-                color: #e2e8f0;
-                font-family: 'Consolas', 'Courier New', monospace;
-                font-size: 13px;
-                padding: 14px;
-                selection-background-color: #1e40af;
-            }
-            QPushButton {
-                border-radius: 8px;
-                padding: 10px 18px;
-                font-size: 13px;
-                font-weight: 600;
-                border: none;
-            }
-            QPushButton#btn_camera {
-                background-color: #1d4ed8;
-                color: #ffffff;
-            }
-            QPushButton#btn_camera:hover {
-                background-color: #2563eb;
-            }
-            QPushButton#btn_camera:checked {
-                background-color: #b91c1c;
-            }
-            QPushButton#btn_camera:checked:hover {
-                background-color: #dc2626;
-            }
-            QPushButton#btn_scan {
-                background-color: #059669;
-                color: #ffffff;
-                font-size: 14px;
-                font-weight: bold;
-                padding: 12px 24px;
-            }
-            QPushButton#btn_scan:hover {
-                background-color: #10b981;
-            }
-            QPushButton#btn_scan:disabled {
-                background-color: #1f2937;
-                color: #4b5563;
-            }
-            QPushButton#btn_export {
-                background-color: #0284c7;
-                color: #ffffff;
-            }
-            QPushButton#btn_export:hover {
-                background-color: #0369a1;
-            }
-            QPushButton#btn_upload {
-                background-color: #7c3aed;
-                color: #ffffff;
-                font-weight: bold;
-            }
-            QPushButton#btn_upload:hover {
-                background-color: #6d28d9;
-            }
-            QPushButton#btn_pdf {
-                background-color: #dc2626;
-                color: #ffffff;
-                font-weight: bold;
-            }
-            QPushButton#btn_pdf:hover {
-                background-color: #b91c1c;
-            }
-            QPushButton#btn_secondary {
-                background-color: #21262d;
-                color: #c9d1d9;
-                border: 1px solid #30363d;
-            }
-            QPushButton#btn_secondary:hover {
-                background-color: #30363d;
-                color: #ffffff;
-            }
-            QStatusBar {
-                background-color: #0a0d14;
-                color: #8b949e;
-                font-size: 12px;
-                padding: 3px 10px;
-                border-top: 1px solid #21262d;
-            }
-            QProgressBar {
-                background-color: #21262d;
-                border-radius: 4px;
-                border: none;
-                height: 4px;
-            }
-            QProgressBar::chunk {
-                background-color: #38bdf8;
-                border-radius: 4px;
-            }
-            QComboBox {
-                background-color: #161b22;
-                color: #e2e8f0;
-                border: 1px solid #30363d;
-                border-radius: 8px;
-                padding: 8px 12px;
-                font-size: 13px;
-                min-width: 200px;
-            }
-            QComboBox:hover {
-                border-color: #38bdf8;
-            }
-            QLabel#badge_searching {
-                background-color: #21262d;
-                color: #8b949e;
-                padding: 4px 12px;
-                border-radius: 12px;
-                font-size: 11px;
-                font-weight: bold;
-            }
-            QLabel#badge_found {
-                background-color: #064e3b;
-                color: #6ee7b7;
-                padding: 4px 12px;
-                border-radius: 12px;
-                font-size: 11px;
-                font-weight: bold;
-            }
-            QLabel#badge_blurry {
-                background-color: #7f1d1d;
-                color: #fca5a5;
-                padding: 4px 12px;
-                border-radius: 12px;
-                font-size: 11px;
-                font-weight: bold;
-            }
-            QLabel#badge_confidence_neutral {
-                background-color: #21262d;
-                color: #8b949e;
-                padding: 4px 12px;
-                border-radius: 12px;
-                font-size: 11px;
-                font-weight: bold;
-            }
-            QLabel#badge_confidence_high {
-                background-color: #064e3b;
-                color: #6ee7b7;
-                padding: 4px 12px;
-                border-radius: 12px;
-                font-size: 11px;
-                font-weight: bold;
-            }
-            QLabel#badge_confidence_fair {
-                background-color: #78350f;
-                color: #fcd34d;
-                padding: 4px 12px;
-                border-radius: 12px;
-                font-size: 11px;
-                font-weight: bold;
-            }
-            QLabel#badge_confidence_smart_ai {
-                background-color: #082f49;
-                color: #38bdf8;
-                border: 1px solid #0284c7;
-                padding: 4px 12px;
-                border-radius: 12px;
-                font-size: 11px;
-                font-weight: bold;
-            }
-        """)
+        self.setStyleSheet(theme.build_app_stylesheet(self.theme_name))
 
     # ── UI Layout ─────────────────────────────────────────
     def _build_ui(self):
@@ -547,23 +330,31 @@ class LiveDocApp(QMainWindow):
 
         title = QLabel("LiveDoc")
         title.setObjectName("title_label")
-        sub = QLabel("Real-Time Intelligent Document Digitizer  •  Computer Vision + YOLO + PaddleOCR + Smart AI")
-        sub.setObjectName("subtitle_label")
-        sub.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        self.subtitle = ElidedLabel("Real-Time Intelligent Document Digitizer  •  Computer Vision + YOLO + PaddleOCR + Smart AI")
+        self.subtitle.setObjectName("subtitle_label")
+        self.subtitle.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
-        self.doc_badge = QLabel("  Searching for document...")
+        # Elided labels shrink with the window instead of forcing it to stay wide
+        self.doc_badge = ElidedLabel("  Searching for document...")
         self.doc_badge.setObjectName("badge_searching")
 
-        self.confidence_badge = QLabel("  Confidence: —")
+        self.confidence_badge = ElidedLabel("  Confidence: —")
         self.confidence_badge.setObjectName("badge_confidence_neutral")
+
+        self.btn_theme = QPushButton()
+        self.btn_theme.setObjectName("btn_theme")
+        self.btn_theme.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_theme.clicked.connect(self._toggle_theme)
 
         header_layout.addWidget(title)
         header_layout.addSpacing(14)
-        header_layout.addWidget(sub)
-        header_layout.addStretch()
+        header_layout.addWidget(self.subtitle)
+        header_layout.addStretch(1)
         header_layout.addWidget(self.doc_badge)
         header_layout.addSpacing(8)
         header_layout.addWidget(self.confidence_badge)
+        header_layout.addSpacing(8)
+        header_layout.addWidget(self.btn_theme)
         root_layout.addWidget(header)
 
         # Progress bar
@@ -573,9 +364,10 @@ class LiveDocApp(QMainWindow):
         root_layout.addWidget(self.progress)
 
         # Main splitter (Camera | Results Tabs)
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        # (switches to a vertical stack on narrow windows, see _update_responsive_layout)
+        self.splitter = splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setHandleWidth(2)
-        splitter.setStyleSheet("QSplitter::handle { background-color: #30363d; }")
+        splitter.setChildrenCollapsible(False)
 
         # ── Left: Camera panel ──
         cam_panel = QWidget()
@@ -591,7 +383,7 @@ class LiveDocApp(QMainWindow):
         self.cam_label.setObjectName("cam_feed")
         self.cam_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.cam_label.setText("Camera Off\n\nClick 'Start Camera' below to begin")
-        self.cam_label.setMinimumSize(600, 460)
+        self.cam_label.setMinimumSize(280, 200)
         self.cam_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         cam_layout.addWidget(self.cam_label, 1)
 
@@ -608,15 +400,18 @@ class LiveDocApp(QMainWindow):
         result_layout.addWidget(res_header)
 
         self.tabs = QTabWidget()
+        self.tabs.setUsesScrollButtons(True)
+        self.tabs.tabBar().setExpanding(False)
+        self.tabs.tabBar().setElideMode(Qt.TextElideMode.ElideRight)
 
         # Tab 0: Physical Document View (2D Visual Layout with exact element bounding boxes)
         self.tab_visual_scroll = QScrollArea()
+        self.tab_visual_scroll.setObjectName("visual_scroll")
         self.tab_visual_scroll.setWidgetResizable(True)
-        self.tab_visual_scroll.setStyleSheet("background-color: #161b22; border: none;")
         self.tab_visual_label = QLabel()
         self.tab_visual_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.tab_visual_label.setText("Physical document layout with exact 2D element coordinates will render here after scanning...")
-        self.tab_visual_label.setStyleSheet("color: #94a3b8; font-size: 13px; padding: 25px;")
+        self.tab_visual_label.setWordWrap(True)
+        self._show_visual_placeholder()
         self.tab_visual_scroll.setWidget(self.tab_visual_label)
         self.tabs.addTab(self.tab_visual_scroll, "  Visual 2D Layout  ")
 
@@ -656,21 +451,33 @@ class LiveDocApp(QMainWindow):
         self.tab_validation.setReadOnly(True)
         self.tabs.addTab(self.tab_validation, "  Validation Report  ")
 
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         result_layout.addWidget(self.tabs, 1)
         splitter.addWidget(result_panel)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
         splitter.setSizes([680, 640])
         root_layout.addWidget(splitter, 1)
 
         # ── Bottom Controls ──
-        controls = QWidget()
-        ctrl_layout = QHBoxLayout(controls)
-        ctrl_layout.setContentsMargins(0, 4, 0, 0)
-        ctrl_layout.setSpacing(10)
+        # Two wrapping groups: on wide windows they share one row, on narrower
+        # windows they stack, and each group wraps its own buttons as needed.
+        self.controls = QWidget()
+        self.ctrl_layout = QBoxLayout(QBoxLayout.Direction.LeftToRight, self.controls)
+        self.ctrl_layout.setContentsMargins(0, 4, 0, 0)
+        self.ctrl_layout.setSpacing(10)
+
+        self.ctrl_input = QWidget()
+        self.ctrl_input_flow = FlowLayout(self.ctrl_input, h_spacing=10, v_spacing=8)
+        self.ctrl_actions = QWidget()
+        self.ctrl_actions_flow = FlowLayout(self.ctrl_actions, h_spacing=10, v_spacing=8)
 
         # Camera selection
         cam_label = QLabel("Camera:")
-        cam_label.setStyleSheet("color: #94a3b8; font-weight: bold;")
+        cam_label.setObjectName("ctrl_label")
         self.cam_combo = QComboBox()
+        self.cam_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.cam_combo.setMinimumContentsLength(14)
         self.cam_combo.currentIndexChanged.connect(self._on_camera_changed)
 
         self.btn_refresh = QPushButton("Refresh")
@@ -695,7 +502,7 @@ class LiveDocApp(QMainWindow):
 
         # Scan Mode selection
         mode_label = QLabel("Mode:")
-        mode_label.setStyleSheet("color: #38bdf8; font-weight: bold;")
+        mode_label.setObjectName("ctrl_label_accent")
         self.mode_combo = QComboBox()
         self.mode_combo.setObjectName("mode_combo")
         self.mode_combo.addItem("🔄 Auto (Hybrid)", userData="auto")
@@ -727,24 +534,17 @@ class LiveDocApp(QMainWindow):
         self.btn_clear.setObjectName("btn_secondary")
         self.btn_clear.clicked.connect(self._clear_results)
 
-        ctrl_layout.addWidget(cam_label)
-        ctrl_layout.addWidget(self.cam_combo)
-        ctrl_layout.addWidget(self.btn_refresh)
-        ctrl_layout.addSpacing(4)
-        ctrl_layout.addWidget(self.btn_camera)
-        ctrl_layout.addWidget(self.btn_rotate)
-        ctrl_layout.addWidget(self.btn_upload)
-        ctrl_layout.addSpacing(8)
-        ctrl_layout.addWidget(mode_label)
-        ctrl_layout.addWidget(self.mode_combo)
-        ctrl_layout.addWidget(self.btn_ai_settings)
-        ctrl_layout.addStretch()
-        ctrl_layout.addWidget(self.btn_clear)
-        ctrl_layout.addWidget(self.btn_pdf)
-        ctrl_layout.addWidget(self.btn_export)
-        ctrl_layout.addWidget(self.btn_scan)
+        for w in (cam_label, self.cam_combo, self.btn_refresh,
+                  self.btn_camera, self.btn_rotate, self.btn_upload):
+            self.ctrl_input_flow.addWidget(w)
+        for w in (mode_label, self.mode_combo, self.btn_ai_settings,
+                  self.btn_clear, self.btn_pdf, self.btn_export, self.btn_scan):
+            self.ctrl_actions_flow.addWidget(w)
 
-        root_layout.addWidget(controls)
+        self.ctrl_layout.addWidget(self.ctrl_input)
+        self.ctrl_layout.addWidget(self.ctrl_actions)
+
+        root_layout.addWidget(self.controls)
 
         # Status Bar
         self.status_bar = QStatusBar()
@@ -753,6 +553,128 @@ class LiveDocApp(QMainWindow):
 
         # Discover cameras
         self._refresh_cameras()
+
+    # ── Theme (light / dark) ─────────────────────────────────
+    def _toggle_theme(self):
+        self.theme_name = theme.LIGHT if self.theme_name == theme.DARK else theme.DARK
+        theme.save_theme(self.theme_name)
+        self._apply_stylesheet()
+        self._update_theme_button()
+        self._render_formatted_tab()
+        self._update_responsive_layout()
+        self.status_bar.showMessage(f"{self.theme_name.capitalize()} mode enabled")
+
+    def _update_theme_button(self):
+        if self.theme_name == theme.DARK:
+            self.btn_theme.setText("☀️  Light mode")
+            self.btn_theme.setToolTip("Switch to light mode (Ctrl+T)")
+        else:
+            self.btn_theme.setText("🌙  Dark mode")
+            self.btn_theme.setToolTip("Switch to dark mode (Ctrl+T)")
+
+    def _render_formatted_tab(self):
+        """(Re)build the Formatted Document tab using colours suited to the active theme."""
+        if not self.all_pages_html:
+            return
+        pal = theme.PALETTES[self.theme_name]
+        parts = []
+        for page_num, source, html in self.all_pages_html:
+            parts.append(
+                f'<div style="border-bottom: 2px solid {pal["border"]}; margin: 20px 0; padding-bottom: 15px;">'
+                f'<span style="background: {pal["accent_strong"]}; color: #ffffff; padding: 3px 8px; '
+                f'border-radius: 4px; font-size: 11px;">PAGE {page_num}</span></div>'
+            )
+            parts.append(theme.adapt_html(html, source, self.theme_name))
+        self.tab_formatted.setHtml("".join(parts))
+
+    @staticmethod
+    def _repolish(widget):
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+
+    # ── Responsive layout ────────────────────────────────────
+    STACK_BREAKPOINT = 980       # below this width: camera on top, results below
+    SUBTITLE_BREAKPOINT = 1100   # below this width: hide the header subtitle
+
+    def _set_initial_size(self):
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            self.resize(1200, 760)
+            return
+        avail = screen.availableGeometry()
+        self.resize(min(1320, int(avail.width() * 0.92)), min(820, int(avail.height() * 0.92)))
+
+    def _update_responsive_layout(self):
+        if not hasattr(self, "splitter") or not hasattr(self, "ctrl_actions_flow"):
+            return
+        width = self.width()
+
+        # Camera | Results side by side on wide windows, stacked on narrow ones
+        wanted = Qt.Orientation.Vertical if width < self.STACK_BREAKPOINT else Qt.Orientation.Horizontal
+        if self.splitter.orientation() != wanted:
+            self.splitter.setOrientation(wanted)
+            self.splitter.setSizes([2, 3] if wanted == Qt.Orientation.Vertical else [680, 640])
+
+        self.subtitle.setVisible(width >= self.SUBTITLE_BREAKPOINT)
+
+        # Toolbar: one row if both groups fit, otherwise stack them
+        margins = self.centralWidget().layout().contentsMargins()
+        available = width - margins.left() - margins.right()
+        input_w = self.ctrl_input_flow.sizeHint().width()
+        actions_w = self.ctrl_actions_flow.sizeHint().width()
+        single_row = input_w + actions_w + self.ctrl_layout.spacing() <= available
+        direction = QBoxLayout.Direction.LeftToRight if single_row else QBoxLayout.Direction.TopToBottom
+        if self.ctrl_layout.direction() != direction:
+            self.ctrl_layout.setDirection(direction)
+        self.ctrl_actions_flow.set_right_align(single_row or actions_w <= available)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_responsive_layout()
+        self._resize_timer.start(150)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self._update_responsive_layout)
+
+    def _on_resize_settled(self):
+        """Re-scale pixmaps that were rendered for the previous window size."""
+        if not self.camera_running and self._preview_frame is not None:
+            self._show_preview_frame()
+        if self._visual_page_args is not None:
+            self._render_visual_page()
+
+    def _on_tab_changed(self, index):
+        if index == 0 and self._visual_page_args is not None:
+            QTimer.singleShot(0, self._render_visual_page)
+
+    def _show_visual_placeholder(self):
+        self._visual_page_args = None
+        self.tab_visual_label.setObjectName("visual_placeholder")
+        self.tab_visual_label.setPixmap(QPixmap())
+        self.tab_visual_label.setText(
+            "Physical document layout with exact 2D element coordinates will render here after scanning..."
+        )
+        self._repolish(self.tab_visual_label)
+
+    def _show_preview_frame(self):
+        """Show the uploaded image in the camera panel, scaled to the current panel size."""
+        frame = self._preview_frame
+        if frame is None:
+            return
+        lbl_w = max(self.cam_label.width(), 280)
+        lbl_h = max(self.cam_label.height(), 200)
+        fh, fw = frame.shape[:2]
+        scale = min(lbl_w / float(fw), lbl_h / float(fh))
+        nw, nh = max(1, int(fw * scale)), max(1, int(fh * scale))
+        thumb = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        # Small label so the user knows which file is loaded
+        cv2.putText(thumb, f"Uploaded: {self._preview_name}", (10, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 220, 100), 2, cv2.LINE_AA)
+        rgb = cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB)
+        qimg = QImage(rgb.data, nw, nh, 3 * nw, QImage.Format.Format_RGB888)
+        self.cam_label.setPixmap(QPixmap.fromImage(qimg))
+        self.cam_label.setText("")
 
     # ── Camera Selection ────────────────────────────────────
     def _refresh_cameras(self):
@@ -816,6 +738,7 @@ class LiveDocApp(QMainWindow):
 
             self.btn_camera.setText("  Stop Camera")
             self.camera_running = True
+            self._preview_frame = None
             self.btn_scan.setEnabled(True)
             self.timer.start(33)
             self.status_bar.showMessage("Camera running — position document in frame")
@@ -949,7 +872,7 @@ class LiveDocApp(QMainWindow):
         self.confidence_badge.style().polish(self.confidence_badge)
 
     def _open_ai_settings(self):
-        dlg = AISettingsDialog(self.smart_ai_engine, self)
+        dlg = AISettingsDialog(self.smart_ai_engine, self, theme_name=self.theme_name)
         dlg.exec()
 
     # ── Scan Execution ──────────────────────────────────────
@@ -987,13 +910,21 @@ class LiveDocApp(QMainWindow):
         White background, every text line / table / figure drawn at the position
         it had on the physical page. Uses the same renderer as the PDF export.
         """
+        self._visual_page_args = {
+            "elements": elements,
+            "image_shape": (doc_data or {}).get("image_shape") or (flat_img.shape[:2] if flat_img is not None else None),
+        }
+        self._render_visual_page()
+
+    def _render_visual_page(self):
+        """Render the last scanned page at a width that fits the current panel."""
+        if self._visual_page_args is None:
+            return
         try:
-            page = {
-                "elements": elements,
-                "image_shape": (doc_data or {}).get("image_shape") or (flat_img.shape[:2] if flat_img is not None else None),
-            }
-            target_w = max(550, min(900, self.tab_visual_scroll.width() - 25))
-            pix = render_page_pixmap(page, target_w)
+            target_w = max(260, min(900, self.tab_visual_scroll.viewport().width() - 30))
+            pix = render_page_pixmap(self._visual_page_args, target_w)
+            self.tab_visual_label.setObjectName("visual_page")
+            self._repolish(self.tab_visual_label)
             self.tab_visual_label.setPixmap(pix)
             self.tab_visual_label.setText("")
         except Exception as e:
@@ -1026,22 +957,10 @@ class LiveDocApp(QMainWindow):
         self.current_frame = frame.copy()
         self._uploaded_image_path = img_path
 
-        # Show thumbnail preview in the camera feed label
-        lbl_w = max(self.cam_label.width(), 320)
-        lbl_h = max(self.cam_label.height(), 240)
-        fh, fw = frame.shape[:2]
-        scale = min(lbl_w / float(fw), lbl_h / float(fh))
-        nw, nh = max(1, int(fw * scale)), max(1, int(fh * scale))
-        thumb = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
-        import os as _os
-        fname = _os.path.basename(img_path)
-        # Draw a small label on the preview so the user knows which file is loaded
-        cv2.putText(thumb, f"Uploaded: {fname}", (10, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 220, 100), 2, cv2.LINE_AA)
-        rgb = cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB)
-        qimg = QImage(rgb.data, nw, nh, 3 * nw, QImage.Format.Format_RGB888)
-        self.cam_label.setPixmap(QPixmap.fromImage(qimg))
-        self.cam_label.setText("")
+        # Show thumbnail preview in the camera feed label (re-scaled on window resize)
+        self._preview_frame = frame
+        self._preview_name = os.path.basename(img_path)
+        self._show_preview_frame()
 
         # Enable Scan button (works even when camera is off) and auto-digitize
         self.btn_scan.setEnabled(True)
@@ -1075,7 +994,8 @@ class LiveDocApp(QMainWindow):
             self._set_confidence_badge("fair", f"Confidence: {score}% [{grade}] ⚠️")
 
         self.all_pages_markdown.append(f"<!-- Page {self.page_count} -->\n" + page_md)
-        self.all_pages_html.append(f'<div style="border-bottom: 2px solid #30363d; margin: 20px 0; padding-bottom: 15px;"><span style="background: #1e40af; color: #fff; padding: 3px 8px; border-radius: 4px; font-size: 11px;">PAGE {self.page_count}</span></div>' + page_html)
+        html_source = theme.SOURCE_PRINT if engine_name.startswith("Smart AI") else theme.SOURCE_DARK
+        self.all_pages_html.append((self.page_count, html_source, page_html))
         self.all_pages_elements.extend(elements)
         self.all_pages_data.append({
             "image": flat_img.copy() if flat_img is not None else None,
@@ -1092,8 +1012,7 @@ class LiveDocApp(QMainWindow):
             self._render_annotated_document(flat_img, elements, doc_data.get("tokens", []), doc_data)
 
         # 1. Update Formatted Document Tab
-        combined_html = "".join(self.all_pages_html)
-        self.tab_formatted.setHtml(combined_html)
+        self._render_formatted_tab()
 
         # 2. Update Markdown Tab
         combined_md = "\n\n---\n\n".join(self.all_pages_markdown)
@@ -1258,8 +1177,7 @@ class LiveDocApp(QMainWindow):
         self.all_pages_html = []
         self.all_pages_elements = []
         self.all_pages_data = []
-        self.tab_visual_label.setPixmap(QPixmap())
-        self.tab_visual_label.setText("Physical document layout with exact 2D element coordinates will render here after scanning...")
+        self._show_visual_placeholder()
         self.page_count = 0
         self.status_bar.showMessage("Results cleared.")
 
@@ -1267,7 +1185,8 @@ class LiveDocApp(QMainWindow):
         self.progress.setVisible(False)
         self.btn_scan.setEnabled(True)
         self.btn_scan.setText("  Scan Document")
-        self.tab_formatted.setHtml(f'<div style="color: #ef4444; font-weight: bold; padding: 20px;">Scan Error: {msg}</div>')
+        error_color = theme.PALETTES[self.theme_name]["error_text"]
+        self.tab_formatted.setHtml(f'<div style="color: {error_color}; font-weight: bold; padding: 20px;">Scan Error: {msg}</div>')
         self.status_bar.showMessage(f"Scan failed: {msg}")
 
     # ── Cleanup ───────────────────────────────────────────
