@@ -203,10 +203,15 @@ class LayoutAnalyzer:
         # -------------------------------------------------------------
         # 1.5 Detect Large Graphic Figures / Diagrams (Non-Table)
         # -------------------------------------------------------------
+        # Mask text lines out of fig_mask to prevent paragraphs being misclassified as images
+        line_k = cv2.getStructuringElement(cv2.MORPH_RECT, (max(8, int(w * 0.03)), 2))
+        text_lines_mask = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, line_k)
+        dilated_text = cv2.dilate(text_lines_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)), iterations=1)
         fig_mask = closed_thresh.copy()
         for tb in table_boxes:
             x1, y1, x2, y2 = tb["box"]
             fig_mask[max(0, y1 - 4):min(h, y2 + 4), max(0, x1 - 4):min(w, x2 + 4)] = 0
+        fig_mask[dilated_text > 0] = 0
 
         # Detect prominent non-text graphical contours (drawings, photos, charts)
         fig_cnts, _ = cv2.findContours(fig_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)

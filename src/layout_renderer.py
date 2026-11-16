@@ -181,6 +181,8 @@ def layout_page(elements: List[Dict[str, Any]], W: int, H: int) -> Tuple[List[Tu
     """
     Assign a box to every element. Elements that carry coordinates keep them;
     others flow top-to-bottom below the last placed element.
+    Prevents diagram crops from overlapping with text elements and guarantees
+    all text elements below a figure are cleanly pushed down.
     Returns (items, page_height) where page_height >= H.
     """
     items = []
@@ -188,53 +190,24 @@ def layout_page(elements: List[Dict[str, Any]], W: int, H: int) -> Tuple[List[Tu
     flow_y = H * 0.03
     body_px = max(10.0, W * 0.018)
 
-    # Collect all image bounding boxes to suppress overlapping text (e.g. chart axis labels / data points)
-    image_boxes = []
-    for el in elements or []:
-        if el.get("type") in ("Image", "Figure", "Picture"):
-            b = el.get("box")
-            if b and len(b) >= 4 and b[2] > b[0] and b[3] > b[1]:
-                image_boxes.append([float(v) for v in b[:4]])
+    all_have_boxes = all(
+        e.get("box") and len(e["box"]) >= 4 and e["box"][2] > e["box"][0] and e["box"][3] > e["box"][1]
+        for e in (elements or [])
+    )
+    if all_have_boxes:
+        sorted_elements = sorted(elements or [], key=lambda e: (e.get("box", [0, 0, 0, 0])[1], e.get("box", [0, 0, 0, 0])[0]))
+    else:
+        # Preserve reading sequence so unboxed paragraphs flow in natural document order
+        sorted_elements = list(elements or [])
 
-    def sort_key(e):
-        b = e.get("box")
-        return b[1] if b else e.get("top_y", 0)
+    occupied_image_boxes = []
 
-    for el in sorted(elements or [], key=sort_key):
+    for el in sorted_elements:
         box = el.get("box")
         etype = el.get("type", "Paragraph")
 
-        # Suppress text elements whose boxes collide with an Image (internal chart labels)
-        if etype in ("Paragraph", "Heading") and box and len(box) >= 4:
-            bx1, by1, bx2, by2 = [float(v) for v in box[:4]]
-            collides_with_image = False
-            for ib in image_boxes:
-                ix1, iy1, ix2, iy2 = ib
-                ox = max(0.0, min(bx2, ix2 + 40) - max(bx1, ix1 - 60))
-                oy = max(0.0, min(by2, iy2) - max(by1, iy1))
-                b_area = max(1.0, (bx2 - bx1) * (by2 - by1))
-                if (ox * oy) / b_area > 0.35 or (oy > 0.60 * (by2 - by1) and ox > 0.40 * (bx2 - bx1)):
-                    collides_with_image = True
-                    break
-            if collides_with_image:
-                continue
-
-        if box and len(box) >= 4 and box[2] > box[0] and box[3] > box[1]:
-            b = [float(v) for v in box[:4]]
-            items.append((el, b))
-            flow_y = max(flow_y, b[3] + H * 0.005)
-            continue
-
-        text = clean_display_text(el.get("text") or el.get("content", ""))
-        width = W - 2 * margin
-        if etype == "Title":
-            h = body_px * 2.2
-        elif etype == "Heading":
-            h = body_px * 1.8
-        elif etype == "Table":
-            headers, rows = _table_cells(el)
-            h = body_px * 1.9 * (len(rows) + 1)
-        elif etype in ("Image", "Figure", "Picture"):
+        # ── 1. Figure / Image / Picture ──────────────────────────
+        if etype in ("Image", "Figure", "Picture"):
             path = el.get("image_path")
             raw_cap = el.get("caption") or el.get("content") or ""
             if raw_cap.startswith("![") and "](" in raw_cap:
@@ -244,6 +217,19 @@ def layout_page(elements: List[Dict[str, Any]], W: int, H: int) -> Tuple[List[Tu
             has_cap = bool(caption and not re.match(r"^figure\s*\d*$", caption.lower()))
             cap_h = (body_px * 1.6) if has_cap else 0.0
 
+            if box and len(box) >= 4 and box[2] > box[0] and box[3] > box[1]:
+                bx1, by1, bx2, by2 = [float(v) for v in box[:4]]
+                if not all_have_boxes:
+                    by1 = max(by1, flow_y)
+                    by2 = by1 + float(box[3] - box[1])
+                # Ensure allocated box includes caption space so following elements never collide
+                allocated_box = [bx1, by1, bx2, by2 + cap_h + body_px * 0.35]
+                items.append((el, allocated_box))
+                occupied_image_boxes.append(allocated_box)
+                flow_y = max(flow_y, allocated_box[3] + H * 0.006)
+                continue
+
+            width = W - 2 * margin
             if path and os.path.exists(path):
                 img = QImage(path)
                 if not img.isNull() and img.width() > 0 and img.height() > 0:
@@ -258,16 +244,73 @@ def layout_page(elements: List[Dict[str, Any]], W: int, H: int) -> Tuple[List[Tu
                     x1 = (W - target_w) / 2.0
                     x2 = x1 + target_w
                     total_h = target_h + cap_h + body_px * 0.4
-                    items.append((el, [x1, flow_y, x2, flow_y + total_h]))
+                    allocated_box = [x1, flow_y, x2, flow_y + total_h]
+                    items.append((el, allocated_box))
+                    occupied_image_boxes.append(allocated_box)
                     flow_y += total_h + body_px * 0.8
                     continue
 
             h = W * 0.28 + cap_h
-            items.append((el, [margin, flow_y, W - margin, flow_y + h]))
+            allocated_box = [margin, flow_y, W - margin, flow_y + h]
+            items.append((el, allocated_box))
+            occupied_image_boxes.append(allocated_box)
             flow_y += h + body_px * 0.8
             continue
+
+        # ── 2. Boxed Text / Tables / Headings ────────────────────
+        if box and len(box) >= 4 and box[2] > box[0] and box[3] > box[1]:
+            bx1, by1, bx2, by2 = [float(v) for v in box[:4]]
+
+            # Check collision with previously placed image crops
+            shift_y = 0.0
+            is_internal_label = False
+            for ib in occupied_image_boxes:
+                ix1, iy1, ix2, iy2 = ib
+                # If they share horizontal span
+                if max(bx1, ix1) < min(bx2, ix2) - 10:
+                    # If this text box starts inside or immediately beneath the image box
+                    if by1 < iy2 + 4.0 and by2 > iy1:
+                        # Check if this is an internal axis label / state name inside the graphic
+                        b_area = max(1.0, (bx2 - bx1) * (by2 - by1))
+                        overlap_x = max(0.0, min(bx2, ix2) - max(bx1, ix1))
+                        overlap_y = max(0.0, min(by2, iy2) - max(by1, iy1))
+                        if (overlap_x * overlap_y) / b_area > 0.65 and (by2 - by1) < 25 and (bx2 - bx1) < 55:
+                            is_internal_label = True
+                            break
+                        # Otherwise it is legitimate text: strictly push it below the diagram crop!
+                        needed_shift = (iy2 + 8.0) - by1
+                        shift_y = max(shift_y, needed_shift)
+
+            if is_internal_label:
+                continue
+
+            if shift_y > 0.0:
+                by1 += shift_y
+                by2 += shift_y
+                if el.get("lines"):
+                    for seg in el["lines"]:
+                        if seg.get("box"):
+                            seg["box"][1] += shift_y
+                            seg["box"][3] += shift_y
+
+            b = [bx1, by1, bx2, by2]
+            items.append((el, b))
+            flow_y = max(flow_y, b[3] + H * 0.005)
+            continue
+
+        # ── 3. Flowing Text (Smart AI / unboxed elements) ────────
+        text = clean_display_text(el.get("text") or el.get("content", ""))
+        width = W - 2 * margin
+        if etype == "Title":
+            h = body_px * 2.2
+        elif etype == "Heading":
+            h = body_px * 1.8
+        elif etype == "Table":
+            headers, rows = _table_cells(el)
+            h = body_px * 1.9 * (len(rows) + 1)
         else:
             h = _wrapped_height(text, _font(body_px), width) + body_px * 0.6
+
         items.append((el, [margin, flow_y, W - margin, flow_y + h]))
         flow_y += h + body_px * 0.6
 

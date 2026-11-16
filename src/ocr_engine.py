@@ -20,6 +20,11 @@ from src.table_extractor import TableExtractor
 from src.validator import DocumentValidator
 from src.layout_analyzer import LayoutAnalyzer
 
+FIG_CAPTION_START_RE = re.compile(
+    r"(?i)^\s*(?:\[\s*\d+\s*\]\s*|\(\s*\d+\s*\)\s*|\b\d+[\.\)]\s*)?"
+    r"(?:fig(?:ure|\.)?|chart|diagram|graph|illustration|scheme|photo|image)\b"
+)
+
 
 class OCREngine:
     def __init__(self, lang='en'):
@@ -324,26 +329,25 @@ class OCREngine:
             bx1, by1, bx2, by2 = tb["box"]
             edges[max(0, by1 - 5):min(h, by2 + 5), max(0, bx1 - 5):min(w, bx2 + 5)] = 0
 
-        FIG_CAPTION_RE = re.compile(r"(?i)\b(?:fig(?:\.|ure)?|chart|diagram|graph|scheme)\b")
-
-        # 2. Mask only long prose tokens (> 6 chars and not figure caption or short math/state labels)
-        # This keeps state circles, arrows, logic gates, and short labels intact
+        # 2. Mask prose tokens to keep only genuine graphical strokes, charts, circuits, and state circles
+        # Masking prose tokens (and captions) ensures morphological bridges never connect text lines into the diagram
         edges_no_prose = edges.copy()
         for i, t in enumerate(tokens):
             if i in assigned_token_indices:
                 continue
             txt = t["text"].strip()
-            if FIG_CAPTION_RE.search(txt) or len(txt) <= 6:
-                continue
-            tx1 = max(0, int(t["min_x"]) - 2)
-            ty1 = max(0, int(t["min_y"]) - 2)
-            tx2 = min(w, int(t["max_x"]) + 2)
-            ty2 = min(h, int(t["max_y"]) + 2)
-            edges_no_prose[ty1:ty2, tx1:tx2] = 0
+            # Diagram labels are very short isolated symbols (e.g. 'q0', 'q1', '0', '1', 'A')
+            is_diagram_symbol = (len(txt) <= 3 and t["w"] < 40 and not any(c.isspace() for c in txt))
+            if not is_diagram_symbol:
+                tx1 = max(0, int(t["min_x"]) - 2)
+                ty1 = max(0, int(t["min_y"]) - 2)
+                tx2 = min(w, int(t["max_x"]) + 2)
+                ty2 = min(h, int(t["max_y"]) + 2)
+                edges_no_prose[ty1:ty2, tx1:tx2] = 0
 
-        # Morphological bridge kernel to connect state circles, arrows, flowchart blocks
-        bridge_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 17))
-        dilated = cv2.dilate(edges_no_prose, bridge_kernel, iterations=2)
+        # Morphological bridge kernel to connect broken diagram lines without jumping into text lines
+        bridge_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
+        dilated = cv2.dilate(edges_no_prose, bridge_kernel, iterations=1)
 
         cnts, _ = cv2.findContours(dilated, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         fig_boxes = []
@@ -374,13 +378,10 @@ class OCREngine:
             # Tokens inside candidate box
             inside_tokens = [
                 t for t in tokens
-                if (bx - 10 <= t["cx"] <= bx + bw + 10) and (by - 10 <= t["cy"] <= by + bh + 10)
+                if (bx - 5 <= t["cx"] <= bx + bw + 5) and (by - 5 <= t["cy"] <= by + bh + 5)
             ]
-            caption_raw = next((t["text"].strip() for t in inside_tokens if FIG_CAPTION_RE.search(t["text"].strip())), "")
-            caption_match = ""
-            if caption_raw:
-                cm = re.search(r"(?i)\b(?:fig(?:\.|ure)?|chart|diagram|graph|scheme)\b.*", caption_raw)
-                caption_match = cm.group(0).strip() if cm else caption_raw
+            caption_raw = next((t["text"].strip() for t in inside_tokens if FIG_CAPTION_START_RE.match(t["text"].strip())), "")
+            caption_match = caption_raw.strip() if caption_raw else ""
             has_fig_caption = bool(caption_match)
 
             # Allow diagrams with multiple internal state/transition labels
@@ -400,9 +401,9 @@ class OCREngine:
             if i in assigned_token_indices:
                 continue
             txt = t["text"].strip()
-            if FIG_CAPTION_RE.search(txt):
+            if FIG_CAPTION_START_RE.match(txt):
                 cx, cy = t["cx"], t["cy"]
-                # Check if this caption is already inside any fig_box
+                # Check if this caption is already assigned
                 already_covered = any(
                     fb["box"][0] - 15 <= cx <= fb["box"][2] + 15 and fb["box"][1] - 15 <= cy <= fb["box"][3] + 15
                     for fb in fig_boxes
@@ -411,12 +412,25 @@ class OCREngine:
                     # Look for nearest candidate figure directly above the caption
                     for fb in fig_boxes:
                         fbx1, fby1, fbx2, fby2 = fb["box"]
-                        if (fbx1 - 60 <= cx <= fbx2 + 60) and (fby2 <= cy <= fby2 + 80):
-                            fb["box"][3] = max(fb["box"][3], int(t["max_y"]) + 5)
-                            fb["box"][0] = min(fb["box"][0], int(t["min_x"]) - 5)
-                            fb["box"][2] = max(fb["box"][2], int(t["max_x"]) + 5)
+                        if (fbx1 - 60 <= cx <= fbx2 + 60) and (fby2 <= cy <= fby2 + 105):
+                            # Associate caption with figure without extending crop box over text
                             fb["caption"] = txt
                             break
+
+        # 4. Strictly trim diagram bounding boxes so they never overlap adjacent prose lines
+        for fb in fig_boxes:
+            bx1, by1, bx2, by2 = fb["box"]
+            for t in tokens:
+                txt = t["text"].strip()
+                if FIG_CAPTION_START_RE.match(txt):
+                    continue
+                # If a prose token intersects the top boundary of the diagram box
+                if (bx1 - 10 <= t["cx"] <= bx2 + 10) and (by1 <= t["cy"] <= by1 + 25):
+                    by1 = max(by1, int(t["max_y"]) + 2)
+                # If a prose token intersects the bottom boundary of the diagram box
+                if (bx1 - 10 <= t["cx"] <= bx2 + 10) and (by2 - 25 <= t["cy"] <= by2):
+                    by2 = min(by2, int(t["min_y"]) - 2)
+            fb["box"] = [bx1, by1, bx2, max(by1 + 20, by2)]
 
         return fig_boxes
 
@@ -722,11 +736,11 @@ class OCREngine:
             fig_abs_path = os.path.abspath(fig_rel_path)
             cv2.imwrite(fig_abs_path, fig_crop)
 
-            # Suppress all tokens inside and immediately surrounding the figure box
-            # (suppresses state labels, transition tags, internal legends, numbers, and captions from forming stray paragraphs)
+            # Suppress ONLY tokens strictly inside the figure graphic crop
+            # (suppresses state labels, transition tags, internal legends, numbers)
             for i, t in enumerate(tokens):
                 if i not in assigned_token_indices:
-                    if (bx1 - 15 <= t["cx"] <= bx2 + 15) and (by1 - 15 <= t["cy"] <= by2 + 15):
+                    if (cx1 + 2 <= t["cx"] <= cx2 - 2) and (cy1 + 2 <= t["cy"] <= cy2 - 2):
                         assigned_token_indices.add(i)
 
             # Look for caption line right below or above the figure if not already present
@@ -736,12 +750,11 @@ class OCREngine:
                 for i, t in enumerate(tokens):
                     if i in assigned_token_indices:
                         continue
-                    is_near_y = (by2 <= t["cy"] <= by2 + 50) or (by1 - 50 <= t["cy"] <= by1)
+                    is_near_y = (by2 <= t["cy"] <= by2 + 105) or (by1 - 50 <= t["cy"] <= by1)
                     is_aligned_x = (bx1 - 40 <= t["cx"] <= bx2 + 40)
                     if is_near_y and is_aligned_x:
                         txt = t["text"].strip()
-                        m = re.search(r"(?i)\b(fig|figure|diagram|chart|illustration)\b.*", txt)
-                        if m:
+                        if FIG_CAPTION_START_RE.match(txt):
                             cap_cy = t["cy"]
                             for j, t2 in enumerate(tokens):
                                 if j not in assigned_token_indices and abs(t2["cy"] - cap_cy) < 14 and (bx1 - 60 <= t2["cx"] <= bx2 + 60):
@@ -755,10 +768,12 @@ class OCREngine:
                 else:
                     caption_text = f"Figure {fig_counter}"
             else:
-                # If caption was matched on an internal token, ensure that token is suppressed from prose
+                # If caption was already found, suppress ONLY the caption tokens from prose
                 for i, t in enumerate(tokens):
-                    if i not in assigned_token_indices and (caption_text in t["text"].strip() or t["text"].strip() in caption_text):
-                        assigned_token_indices.add(i)
+                    if i not in assigned_token_indices:
+                        txt = t["text"].strip()
+                        if FIG_CAPTION_START_RE.match(txt) and (by2 - 10 <= t["cy"] <= by2 + 105 or by1 - 50 <= t["cy"] <= by1 + 10):
+                            assigned_token_indices.add(i)
 
             assigned_token_indices.update(img_token_indices)
 

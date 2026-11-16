@@ -157,7 +157,28 @@ In local (offline) mode, PaddleOCR missed small text, subscripts, superscripts, 
 
 ---
 
-## 11. Verification & Test Suite Status
+## 12. Diagram Crop Spatial Collision Isolation & Layout Geometry Protection
+
+### Problem Statement
+During document scanning, diagram and figure crops accurately isolated drawings, but when reconstructing the layout in the 2D visual tab and PDF exports, diagram crops overlapped with following text elements. In some cases, body text lines directly beneath a chart or figure were pushed underneath the image crop or swallowed as captions.
+
+### Engineering Solutions Implemented:
+1. **Strict Caption Start Anchoring (`src/ocr_engine.py`)**:
+   - Replaced substring caption matching with `FIG_CAPTION_START_RE` (`^\s*(?:fig(?:ure|\.)?|chart|diagram|graph)\b`), preventing regular prose sentences (e.g., `"As the figure shows..."`) from being misclassified as figure captions or swallowed into diagram crops.
+   - All prose tokens are strictly masked in `edges_no_prose` before edge dilation, preventing body text lines from connecting to graphic contours.
+   - Added boundary trimming so diagram boxes are strictly constrained to the graphic itself and do not cut into adjacent text lines.
+2. **Spatial Collision Resolution & Dynamic Vertical Shift (`src/layout_renderer.py`)**:
+   - Allocated bounding boxes for figures now include the image height plus caption height and typography padding (`cap_h + body_px * 0.4`).
+   - Implemented dynamic collision detection: when a text element shares horizontal span with an image and starts inside or immediately beneath the image box, its vertical position is shifted down (`by1 = iy2 + 8.0px`).
+   - Line-level segments (`el["lines"]`) have their bounding boxes shifted down by the exact same offset, guaranteeing zero overlap on the Visual 2D Layout preview.
+3. **Collision Protection in Vector PDF Exporter (`src/pdf_exporter.py`)**:
+   - Added occupied image region tracking in `create_digital_reconstructed_pdf()`. Any text element positioned beneath or overlapping a diagram is shifted down so text is never drawn underneath or on top of a diagram crop in the exported PDF.
+4. **Text Line Filtering in Layout Analyzer (`src/layout_analyzer.py`)**:
+   - Subtracted morphological text lines from `fig_mask` in `_cv_analyze()` to ensure standard text paragraphs are never misclassified as `Image`.
+
+---
+
+## 13. Verification & Test Suite Status
 
 - **Main Pipeline Integration Test (`test_pipeline.py`)**: **24/24 PASS**
 - **Unit Test Suite (`tests/`)**: **12/12 PASS** (`test_sandwich_pdf`, `test_table_extractor`, `test_validator`)

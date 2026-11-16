@@ -617,15 +617,22 @@ class PDFExporter:
                     raw_tokens = page_info["doc_data"].get("tokens", [])
 
                 if elements:
-                    # Sort top to bottom
-                    sorted_elements = sorted(
-                        elements,
-                        key=lambda e: e.get("box", [0, 0, 0, 0])[1] if e.get("box") else e.get("top_y", 0)
+                    all_have_boxes = all(
+                        e.get("box") and len(e["box"]) >= 4 and e["box"][2] > e["box"][0] and e["box"][3] > e["box"][1]
+                        for e in elements
                     )
+                    if all_have_boxes:
+                        sorted_elements = sorted(
+                            elements,
+                            key=lambda e: (e.get("box", [0, 0, 0, 0])[1], e.get("box", [0, 0, 0, 0])[0])
+                        )
+                    else:
+                        sorted_elements = list(elements)
 
                     _L = 28.0                   # left margin (pt)
                     _R = page_w - 22.0          # right margin (pt)
                     _flow_y = 28.0              # flowing cursor for elements without box
+                    occupied_image_boxes = []
 
                     for el in sorted_elements:
                         el_type = el.get("type", "Paragraph")
@@ -643,6 +650,28 @@ class PDFExporter:
                             y0 = max(5.0, min(page_h - 15.0, y0))
                             x1 = max(x0 + 15.0, min(page_w - 18.0, x1))
                             y1 = max(y0 + 10.0, min(page_h - 10.0, y1))
+
+                            # Prevent text elements from colliding or being overlapped by diagram crops
+                            if el_type not in ("Image", "Figure", "Picture"):
+                                shift_y = 0.0
+                                is_internal_label = False
+                                for ix0, iy0, ix1, iy1 in occupied_image_boxes:
+                                    if max(x0, ix0) < min(x1, ix1) - 6.0:
+                                        if y0 < iy1 + 4.0 and y1 > iy0:
+                                            b_area = max(1.0, (x1 - x0) * (y1 - y0))
+                                            overlap_x = max(0.0, min(x1, ix1) - max(x0, ix0))
+                                            overlap_y = max(0.0, min(y1, iy1) - max(y0, iy0))
+                                            if (overlap_x * overlap_y) / b_area > 0.65 and (y1 - y0) < 18 and (x1 - x0) < 40:
+                                                is_internal_label = True
+                                                break
+                                            needed_shift = (iy1 + 6.0) - y0
+                                            shift_y = max(shift_y, needed_shift)
+                                if is_internal_label:
+                                    continue
+                                if shift_y > 0.0:
+                                    y0 += shift_y
+                                    y1 += shift_y
+
                             _flow_y = max(_flow_y, y1 + 3.0)
 
                         else:
@@ -671,6 +700,9 @@ class PDFExporter:
 
                         if x1 <= x0 + 2.0 or y1 <= y0 + 2.0:
                             continue
+
+                        if el_type in ("Image", "Figure", "Picture"):
+                            occupied_image_boxes.append((x0, y0, x1, y1))
 
                         # ── A. Document Title ──────────────────────────────────
                         if el_type == "Title":
